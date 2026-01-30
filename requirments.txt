@@ -1,0 +1,13 @@
+pixi init
+pixi add paramiko
+pixi add boto3
+pixi add botocore awscrt
+
+
+if using vs code. 
+1. in vs code terminal: pixi shell
+2. which python
+3. command shift p
+4. Python:Select Interperter
+5. enter path
+6. use the path from the which python 
