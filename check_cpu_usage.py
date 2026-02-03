@@ -49,7 +49,7 @@ def get_cpu_idle_status(servername: str, user: str) -> List[Dict[str, str]]:
     results = []
     try:
         ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())`
         ssh.connect(hostname=servername, username=user)
 
         # Get isolated CPUs
