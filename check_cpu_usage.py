@@ -186,7 +186,7 @@ def get_all_servers_by_name_tag(owner_tag='Owner', debug=False):
 def main():
     #servers = parse_ssh_config(SSH_CONFIG_PATH)
     serverDict = create_server_dict_from_file('server_list.txt', debug=True)
-    teamsList = sorted(["TAO", "OMNIA", "FZE", "ARB", "PD", "DEFI", "MM", "RWD", "OTC", "TAKE"])
+    teamsList = sorted(["TAO", "OMNIA", "FZE", "ARB", "PD", "DEFI", "MM", "RWD", "OTC", "TAKE", "DLP", "DPDK"])
     all_server_rows = []
     user = 'archy'  # Replace with your username
     server_details = get_all_servers_by_name_tag(owner_tag='Owner', debug=True)
@@ -196,8 +196,8 @@ def main():
             print(f"team {team_key} not found in serverDict.")
             continue
         for idx, server in enumerate(serverDict[team_key], 1):
-            if  server[:3].upper() != 'TA-':
-                print(f"Skipping {server} as it does not start with 'TA-'.")
+            if  server[:3].upper() != 'TA-' and server[:3].upper() != 'AC-':
+                print(f"Skipping {server} as it does not start with 'TA-' or 'AC-'.")
                 continue
             print(f"Checking {server} ({team_key}) as {user}...")
             results = get_cpu_idle_status(server, user)
@@ -209,8 +209,8 @@ def main():
             percent_free = 100 - percent_busy if total > 0 else 0
 
             # Determine AWS_AZ if server name starts with 'TA-'
-            aws_az = server_details.get(server, [{}])[0].get('aws_az', '')
-            owner = server_details.get(server, [{}])[0].get('owner', '')
+            aws_az = server[3:8] if server[:3].upper() == 'TA-' or server[:3].upper() == 'AC-' else server_details.get(server, [{}])[0].get('aws_az', '')
+            owner = server_details.get(server, [{}])[0].get('owner', '') 
             instance_type = server_details.get(server, [{}])[0].get('instance_type', '')
             row = [idx, server, aws_az, team_key, owner, instance_type, f'{percent_busy:.2f}', f'{percent_free:.2f}', ','.join(busy_cpus), ','.join(idle_cpus)]
             all_server_rows.append(row)
