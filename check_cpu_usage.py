@@ -49,7 +49,7 @@ def get_cpu_idle_status(servername: str, user: str) -> List[Dict[str, str]]:
     results = []
     try:
         ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())`
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(hostname=servername, username=user)
 
         # Get isolated CPUs
@@ -93,13 +93,25 @@ def get_cpu_idle_status(servername: str, user: str) -> List[Dict[str, str]]:
             if not t1 or not t2:
                 status = 'Unknown'
             else:
+                # Calculate idle time for the CPU at two time points.
+                # t1[3] is 'idle', t1[4] (if present) is 'iowait' from /proc/stat fields.
                 idle1 = t1[3] + (t1[4] if len(t1) > 4 else 0)
                 idle2 = t2[3] + (t2[4] if len(t2) > 4 else 0)
+
+                # Calculate total time (sum of all fields) at both time points.
                 total1 = sum(t1)
                 total2 = sum(t2)
+
+                # Calculate the change in idle and total time between the two samples.
                 idle_delta = idle2 - idle1
                 total_delta = total2 - total1
+
+                # CPU usage is the proportion of time NOT spent idle between the two samples.
+                # usage = 100 * (1 - (idle_delta / total_delta))
+                # If total_delta is 0 (shouldn't happen), usage is set to 0.
                 usage = 100 * (1 - idle_delta / total_delta) if total_delta > 0 else 0
+
+                # If usage is greater than 1%, consider the CPU 'Busy', else 'Idle'.
                 status = 'Busy' if usage > 1 else 'Idle'  # >1% usage = busy
             results.append({
                 'server': servername,
