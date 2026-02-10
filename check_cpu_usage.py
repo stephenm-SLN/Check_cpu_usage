@@ -4,9 +4,11 @@ import os
 import ast
 from typing import List, Dict
 import boto3
+import requests
 
 SSH_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config')
 OUTPUT_CSV = 'cpu_usage.csv'
+ALI_ECS_INVENTORY_URL = 'http://inventory.devops.selini.tech/alicloud/ecs'  # Replace with actual URL
 
 def parse_ssh_config(config_path: str) -> List[Dict[str, str]]:
     servers = []
@@ -165,7 +167,7 @@ def create_server_dict_from_file(filename, debug=False):
 
 def get_all_servers_by_name_tag(owner_tag='Owner', debug=False):
     """
-    Returns a dict: {Name tag: [ {instance_id, instance_type, owner, aws_az}, ... ]} for all regions.
+    Returns a dict of AWS servers: {Name tag: [ {instance_id, instance_type, owner, aws_az}, ... ]} for all regions.
     """
     ec2 = boto3.client('ec2')
     regions = [r['RegionName'] for r in ec2.describe_regions()['Regions']]
@@ -195,13 +197,47 @@ def get_all_servers_by_name_tag(owner_tag='Owner', debug=False):
                             print(f"{name}: {entry}")
     return all_servers
 
+def fetch_ecs_inventory(url):
+    '''
+    Docstring for fetch_ali_ecs_inventory
+    retrieves ECS inventory from the given URL and processes it into a dictionary.
+    :param url: Description
+    '''
+    response = requests.get(url)
+    response.raise_for_status()
+    data = response.json()
+    result = {}
+    name_counts = {}
+    for item in data:
+        base_name = item.get('name')
+        tags = item.get('tags') or {}
+        entry = {
+            'role': tags.get('role', 'unknown'),
+            'team': tags.get('team', 'unknown'),
+            'instance_type': item.get('instance_type'),
+            'owner': tags.get('owner', tags.get('Owner', 'unknown')),
+            'exchange': tags.get('exchange', tags.get('Exchange', 'unknown')),
+            'environment': tags.get('environment', tags.get('Environment', 'unknown')),
+            'status': item.get('status'),
+        }
+        # Ensure unique key by appending -number if needed
+        if base_name not in name_counts:
+            name_counts[base_name] = 0
+            name = base_name
+        else:
+            name_counts[base_name] += 1
+            name = f"{base_name}-{name_counts[base_name]}"
+        result.setdefault(name, []).append(entry)
+    return result
+
 def main():
     #servers = parse_ssh_config(SSH_CONFIG_PATH)
     serverDict = create_server_dict_from_file('server_list.txt', debug=True)
     teamsList = sorted(["TAO", "OMNIA", "FZE", "ARB", "PD", "DEFI", "MM", "RWD", "OTC", "TAKE", "DLP", "DPDK"])
     all_server_rows = []
     user = 'archy'  # Replace with your username
-    server_details = get_all_servers_by_name_tag(owner_tag='Owner', debug=True)
+    server_AWS_details = get_all_servers_by_name_tag(owner_tag='Owner', debug=True)
+    server_ALI_details = fetch_ecs_inventory(ALI_ECS_INVENTORY_URL)
     for team in teamsList:
         team_key = team.upper()
         if team_key not in serverDict:
@@ -219,7 +255,10 @@ def main():
             total = len(busy_cpus) + len(idle_cpus)
             percent_busy = (len(busy_cpus) / total * 100) if total > 0 else 0
             percent_free = 100 - percent_busy if total > 0 else 0
-
+            if server.startswith('TA-'):
+                server_details = server_AWS_details
+            elif server.startswith('AC-'):
+                server_details = server_ALI_details
             # Determine AWS_AZ if server name starts with 'TA-'
             aws_az = server[3:8] if server[:3].upper() == 'TA-' or server[:3].upper() == 'AC-' else server_details.get(server, [{}])[0].get('aws_az', '')
             owner = server_details.get(server, [{}])[0].get('owner', '') 
