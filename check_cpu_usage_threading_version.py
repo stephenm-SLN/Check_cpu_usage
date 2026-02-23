@@ -1,45 +1,3 @@
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
-# Class to run a PostgreSQL query and return results as a dictionary
-class PostgresQueryRunner:
-    def __init__(self, host, database, user, password, port=5432):
-        self.host = host
-        self.database = database
-        self.user = user
-        self.password = password
-        self.port = port
-
-    def run_query(self, select_statement: str) -> dict:
-        """
-        Executes a SELECT statement and returns a dictionary with 'id' as key and list of row values as value.
-        """
-        conn = None
-        result = {}
-        try:
-            conn = psycopg2.connect(
-                host=self.host,
-                database=self.database,
-                user=self.user,
-                password=self.password,
-                port=self.port
-            )
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(select_statement)
-                rows = cur.fetchall()
-                for row in rows:
-                    row_dict = dict(row)
-                    row_id = row_dict.get('id')
-                    # Remove 'id' from the values list
-                    values = [v for k, v in row_dict.items() if k != 'id']
-                    result[row_id] = values
-        except Exception as e:
-            logging.error(f"Postgres query failed: {e}")
-        finally:
-            if conn:
-                conn.close()
-        return result
-import logging
 import paramiko
 import csv
 import os
@@ -47,29 +5,12 @@ import ast
 from typing import List, Dict
 import boto3
 import requests
+import concurrent.futures
 import time
 
 SSH_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config')
-OUTPUT_CSV = 'cpu_usage.csv'
+OUTPUT_CSV = 'Threaded_cpu_usage.csv'
 ALI_ECS_INVENTORY_URL = 'http://inventory.devops.selini.tech/alicloud/ecs'  # Replace with actual URL
-
-
-
-# Setup logging to file and stdout as a global logger
-script_name = os.path.splitext(os.path.basename(__file__))[0]
-log_formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
-file_handler = logging.FileHandler(f'{script_name}.log')
-file_handler.setFormatter(log_formatter)
-file_handler.setLevel(logging.DEBUG)
-stream_handler = logging.StreamHandler()
-stream_handler.setFormatter(log_formatter)
-stream_handler.setLevel(logging.DEBUG)
-logger = logging.getLogger(script_name)
-logger.setLevel(logging.DEBUG)
-# Prevent duplicate handlers if re-imported
-if not logger.handlers:
-    logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
 
 def parse_ssh_config(config_path: str) -> List[Dict[str, str]]:
     servers = []
@@ -184,7 +125,7 @@ def get_cpu_idle_status(servername: str, user: str) -> List[Dict[str, str]]:
             })
         ssh.close()
     except Exception as e:
-        logger.error(f"Error connecting to {servername}: {e}")
+        print(f"Error connecting to {servername}: {e}")
         results.append({'server': servername, 'cpu': '', 'isolated': '', 'status': f'ERROR: {e}'})
     return results
 
@@ -218,12 +159,12 @@ def create_server_dict_from_file(filename, debug=False):
                         server_dict[key_upper] = server_list
             except Exception as e:
                 if debug:
-                    logger.error(f"Error parsing line: {line} ({e})")
+                    print(f"Error parsing line: {line} ({e})")
     # Sort keys and return OrderedDict
     ordered = OrderedDict(sorted(server_dict.items()))
     if debug:
         for k, v in ordered.items():
-            logger.debug(f"{k}: {v}")
+            print(f"{k}: {v}")
     return ordered
 
 def get_all_servers_by_name_tag(owner_tag='Owner', debug=False):
@@ -255,7 +196,7 @@ def get_all_servers_by_name_tag(owner_tag='Owner', debug=False):
                             all_servers[name] = []
                         all_servers[name].append(entry)
                         if debug:
-                            logger.debug(f"{name}: {entry}")
+                            print(f"{name}: {entry}")
     return all_servers
 
 def fetch_ecs_inventory(url):
@@ -291,6 +232,32 @@ def fetch_ecs_inventory(url):
         result.setdefault(name, []).append(entry)
     return result
 
+def process_server(idx, server, team_key, user, server_AWS_details, server_ALI_details):
+    if server[:3].upper() != 'TA-' and server[:3].upper() != 'AC-':
+        print(f"Skipping {server} as it does not start with 'TA-' or 'AC-'.")
+        return None
+    print(f"Checking {server} ({team_key}) as {user}...")
+    results = get_cpu_idle_status(server, user)
+
+    busy_cpus = [str(r['cpu']) for r in results if r['status'] == 'Busy']
+    idle_cpus = [str(r['cpu']) for r in results if r['status'] == 'Idle']
+    total = len(busy_cpus) + len(idle_cpus)
+    percent_busy = (len(busy_cpus) / total * 100) if total > 0 else 0
+    percent_free = 100 - percent_busy if total > 0 else 0
+    if server.startswith('TA-'):
+        server_details = server_AWS_details
+    elif server.startswith('AC-'):
+        server_details = server_ALI_details
+    else:
+        server_details = {}
+    aws_az = server[3:8] if server[:3].upper() == 'TA-' or server[:3].upper() == 'AC-' else server_details.get(server, [{}])[0].get('aws_az', '')
+    owner = server_details.get(server, [{}])[0].get('owner', '')
+    instance_type = server_details.get(server, [{}])[0].get('instance_type', '')
+    row = [idx, server, aws_az, team_key, owner, instance_type, f'{percent_busy:.2f}', f'{percent_free:.2f}', ','.join(busy_cpus), ','.join(idle_cpus)]
+    # Print to stdout
+    print(f"{idx}, {server}, {aws_az}, {team_key}, owner: {owner}, instance_type: {instance_type}, %Busy: {percent_busy:.2f}, %Free: {percent_free:.2f}, Busy: {','.join(busy_cpus)}, Idle: {','.join(idle_cpus)}")
+    return row
+
 def main():
     #servers = parse_ssh_config(SSH_CONFIG_PATH)
     start_time = time.time()
@@ -299,48 +266,40 @@ def main():
     all_server_rows = []
     user = 'archy'  # Replace with your username
     server_AWS_details = get_all_servers_by_name_tag(owner_tag='Owner', debug=True)
-    logging.debug(f"Fetched AWS server details: {len(server_AWS_details)} entries")
-    logging.debug(f"Sample AWS server details: {list(server_AWS_details.items())[:5]}")
     server_ALI_details = fetch_ecs_inventory(ALI_ECS_INVENTORY_URL)
+
+    # Build a flat list of (team_key, server) pairs across all teams.
+    # This allows us to assign a globally unique 'num' index to each server, regardless of team.
+    all_team_server_pairs = []
     for team in teamsList:
         team_key = team.upper()
         if team_key not in serverDict:
-            logger.error(f"team {team_key} not found in serverDict.")
+            print(f"team {team_key} not found in serverDict.")
             continue
-        for idx, server in enumerate(serverDict[team_key], 1):
-            if  server[:3].upper() != 'TA-' and server[:3].upper() != 'AC-':
-                logger.debug(f"Skipping {server} as it does not start with 'TA-' or 'AC-'.")
-                continue
-            logger.debug(f"Checking {server} ({team_key}) as {user}...")
-            results = get_cpu_idle_status(server, user)
+        servers = serverDict[team_key]
+        for server in servers:
+            all_team_server_pairs.append((team_key, server))
 
-            busy_cpus = [str(r['cpu']) for r in results if r['status'] == 'Busy']
-            idle_cpus = [str(r['cpu']) for r in results if r['status'] == 'Idle']
-            total = len(busy_cpus) + len(idle_cpus)
-            percent_busy = (len(busy_cpus) / total * 100) if total > 0 else 0
-            percent_free = 100 - percent_busy if total > 0 else 0
-            if server.startswith('TA-'):
-                server_details = server_AWS_details
-            elif server.startswith('AC-'):
-                server_details = server_ALI_details
-            # Determine AWS_AZ if server name starts with 'TA-'
-            aws_az = server[3:8] if server[:3].upper() == 'TA-' or server[:3].upper() == 'AC-' else server_details.get(server, [{}])[0].get('aws_az', '')
-            owner = server_details.get(server, [{}])[0].get('owner', '') 
-            instance_type = server_details.get(server, [{}])[0].get('instance_type', '')
-            row = [idx, server, aws_az, team_key, owner, instance_type, f'{percent_busy:.2f}', f'{percent_free:.2f}', ','.join(busy_cpus), ','.join(idle_cpus)]
-            all_server_rows.append(row)
-            # Print to stdout
-            logger.debug(f"{idx}, {server}, {aws_az}, {team_key}, owner: {owner}, instance_type: {instance_type}, %Busy: {percent_busy:.2f}, %Free: {percent_free:.2f}, Busy: {','.join(busy_cpus)}, Idle: {','.join(idle_cpus)}")
-    end_time = time.time() - start_time 
-    logger.info(f"Completed in {end_time:.2f} seconds.")
-
+    # Enumerate globally so that 'num' is unique across all servers (not per team)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_idx_server = {
+            # idx here is the global server number (1..N), not per-team
+            executor.submit(process_server, idx, server, team_key, user, server_AWS_details, server_ALI_details): (idx, server)
+            for idx, (team_key, server) in enumerate(all_team_server_pairs, 1)
+        }
+        for future in concurrent.futures.as_completed(future_to_idx_server):
+            row = future.result()
+            if row:
+                all_server_rows.append(row)
+    end_time = time.time() - start_time
+    print(f"Completed in {end_time:.2f} seconds.")
     # Write all results to CSV
     with open(OUTPUT_CSV, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['num', 'server name', 'AWS_AZ', 'team', 'owner', 'instance_type', '%Busy', '%Free', 'Busy', 'Idle'])
         for row in all_server_rows:
             writer.writerow(row)
-    logger.debug(f"Results written to {OUTPUT_CSV}")
+    print(f"Results written to {OUTPUT_CSV}")
 
 if __name__ == '__main__':
     main()
