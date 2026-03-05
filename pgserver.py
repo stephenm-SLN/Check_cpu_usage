@@ -4,11 +4,12 @@ import logging
 
 # Class to run a PostgreSQL query and return results as a dictionary
 class PostgresQueryRunner:
-    def __init__(self, host, database, user, password, port=5432, logger=None):
-        self.host = host
-        self.database = database
-        self.user = user
-        self.password = password
+    def __init__(self, creds, port=5432, logger=None):
+       
+        self.host = creds.get("host")
+        self.database = creds.get("database")
+        self.user = creds.get("user")
+        self.password = creds.get("password")
         self.port = port
         self.logger = logger
 
@@ -45,17 +46,23 @@ class PostgresQueryRunner:
                 conn.close()
         return result
     
+    @staticmethod
+    def load_db_creds_from_file(file_path: str) -> dict:
+    
+        import json
+        try:
+            with open(file_path, 'r') as f:
+                creds = json.load(f)
+                return creds
+        except Exception as e:
+            logging.error(f"Failed to load database credentials from file: {e}")
+            return {}
+    
 
 if __name__ == "__main__":
      # Example usage
-    host = "steampipe-cache-db-writer.devops.selini.tech"
-    database = "steampipe-cache"
-    user = "steampipe"
-    password = "awZXKa5WNZlwXo8k"
-    port = 5432
-    
-
-    runner = PostgresQueryRunner(host, database, user, password, port, logger=logging.getLogger(__name__))
+    creds = PostgresQueryRunner.load_db_creds_from_file(".DBCreds.json")
+    runner = PostgresQueryRunner(creds, logger=logging.getLogger(__name__))
     query = "SELECT title, instance_type, tags FROM steampipe_cache.aws_ec2_instance WHERE title LIKE 'TA-%' AND instance_state = 'running' AND title IN ('TA-SEO-B-07');"
     result = runner.run_query(query, key='title')
     for key, values in result.items():

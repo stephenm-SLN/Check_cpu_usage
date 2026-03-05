@@ -7,55 +7,14 @@ import boto3
 import requests
 import concurrent.futures
 import time
+from pgserver import PostgresQueryRunner
 import re
+import logging
+from collections import defaultdict
 
 SSH_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config')
 OUTPUT_CSV = 'Threaded_cpu_usage.csv'
 ALI_ECS_INVENTORY_URL = 'http://inventory.devops.selini.tech/alicloud/ecs'  # Replace with actual URL
-
-
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
-# Class to run a PostgreSQL query and return results as a dictionary
-class PostgresQueryRunner:
-    def __init__(self, host, database, user, password, port=5432, logger=None):
-        self.host = host
-        self.database = database
-        self.user = user
-        self.password = password
-        self.port = port
-        self.logger = logger
-
-    def run_query(self, select_statement: str) -> dict:
-        """
-        Executes a SELECT statement and returns a dictionary with 'id' as key and list of row values as value.
-        """
-        conn = None
-        result = {}
-        try:
-            conn = psycopg2.connect(
-                host=self.host,
-                database=self.database,
-                user=self.user,
-                password=self.password,
-                port=self.port
-            )
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(select_statement)
-                rows = cur.fetchall()
-                for row in rows:
-                    row_dict = dict(row)
-                    row_id = row_dict.get('id')
-                    # Remove 'id' from the values list
-                    values = [v for k, v in row_dict.items() if k != 'id']
-                    result[row_id] = values
-        except Exception as e:
-            logging.error(f"Postgres query failed: {e}")
-        finally:
-            if conn:
-                conn.close()
-        return result
 
 def parse_ssh_config(config_path: str) -> List[Dict[str, str]]:
     servers = []
@@ -308,21 +267,25 @@ def parse_lscpu_output(lscpu_lines):
         sockets = 0
 
     # Parse per-CPU/socket mapping from any line with two integers (e.g., '0 0', '47 1', ...)
-    for x in range(sockets):
-        s = ''.join(lscpu_list[x+3][lscpu_list[x+3].find(':')+1:].strip().split())
-        start, end = map(int, s.split('-'))
-        cpus = list(range(start, end + 1))
-        socket_cpu_sets[x] = cpus
+    if iso_cpus == '':
+        socket_cpu_sets = None
+    else:
+        for x in range(sockets):
+            s = ''.join(lscpu_list[x+3][lscpu_list[x+3].find(':')+1:].strip().split())
+            start, end = map(int, s.split('-'))
+            cpus = list(range(start, end + 1))
+            socket_cpu_sets[x] = cpus
 
     return sockets, socket_cpu_sets, iso_cpus
 
-def process_server(idx, servername, team_key, user, server_AWS_details, server_ALI_details):
+def process_server(idx, servername, team_key, user, serverDict_details): #server_AWS_details, server_ALI_details):
     if servername[:3].upper() != 'TA-' and servername[:3].upper() != 'AC-':
         print(f"Skipping {servername} as it does not start with 'TA-' or 'AC-'.")
         return None
     print(f"Checking {servername} ({team_key}) as {user}...")
     results = []
-
+    if servername == 'TA-TKY-FIX-A-01':
+        print(f"Skipping {servername} due to known SSH issues.")
     # Get CPUs per socket using lscpu -e
     #lscpu_cmd = "lscpu -e=CPU,SOCKET | awk 'NR>1 {print $1, $2}'"
     lscpu_cmd = "lscpu | grep -E 'Socket|NUMA'"
@@ -334,10 +297,13 @@ def process_server(idx, servername, team_key, user, server_AWS_details, server_A
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())        
-        ssh.connect(hostname=servername, username=user)
+        ssh.connect(hostname=servername, username=user, timeout=5)
         stdin, stdout, stderr = ssh.exec_command(iso_lscpu_cmd)
         cpu_socket_lines = stdout.read().decode().strip().split('\n')
         sockets, socket_cpu_sets, iso_cpus = parse_lscpu_output('\n'.join(cpu_socket_lines))
+        # If no isolated CPUs, we will check all CPUs and group by socket based on lscpu output. If lscpu output does not provide socket info, we will just check all CPUs without socket grouping.
+        if not socket_cpu_sets:
+            results.append({'status': f"ERROR Parsed lscpu output: no isolated CPUs, {sockets} sockets"})
         ''' 
             results are in the form [{'server': '...', 'cpu': 0, 'isolated': 'yes/no', 'status': 'Busy/Idle'}, ...] 
             Current get_cpu_idle_status checks for isolated CPUs but does not group by socket, so we need to determine which CPUs belong to which socket and then calculate busy/idle percentages per socket.
@@ -370,7 +336,8 @@ def process_server(idx, servername, team_key, user, server_AWS_details, server_A
     except Exception as e:
         print(f"Error connecting to {servername}: {e}")
         results.append({'server': servername, 'cpu': '', 'isolated': '', 'status': f'SSH connect ERROR: {e}'})
-        row = [idx, servername, '', team_key, '', '', '', '', '', '', '', '', results[0]['status'], '', '', '']
+        status = results[0]['status'] if results else f'SSH connect ERROR: {e}'
+        row = [idx, servername, '', team_key, '', '', '', '', '', '', '', '', status, '', '', '']
         return row
     
 
@@ -419,12 +386,8 @@ def process_server(idx, servername, team_key, user, server_AWS_details, server_A
         percent_busy_socket1 = (len(busy_socket1) / total_socket1 * 100) if total_socket1 > 0 else 0
         percent_free_socket1 = 100 - percent_busy_socket1 if total_socket1 > 0 else 0
 
-    if servername.startswith('TA-'):
-        server_details = server_AWS_details
-    elif servername.startswith('AC-'):
-        server_details = server_ALI_details
-    else:
-        server_details = {}
+    
+    server_details = serverDict_details
     aws_az = servername[3:8] if servername[:3].upper() == 'TA-' or servername[:3].upper() == 'AC-' else server_details.get(servername, [{}])[0].get('aws_az', '')
     owner = server_details.get(servername, [{}])[0].get('owner', '')
     instance_type = server_details.get(servername, [{}])[0].get('instance_type', '')
@@ -451,36 +414,86 @@ def process_server(idx, servername, team_key, user, server_AWS_details, server_A
           f"Free_Socket0: {','.join(idle_socket0)}, Free_Socket1: {','.join(idle_socket1)}")
     return row
 
+def create_server_dict_from_pg_query_result(pg_result, debug=False):
+    """
+    Transforms the PostgreSQL query result into a dictionary of the form {team_key: [[{host:server1},{owner:owner1}], [{host:server2},{owner:owner2}], ...]]}.
+    The team_key is derived from the tags which is list of dictionaries. Team  (e.g., 'TA-SEO-B-07' -> 'SEO').
+    and example of the list of dictonaries in the tags column is [{'key': 'team', 'value': 'MM'}, {'key': 'owner', 'value': 'Adam'}]
+    the function iterates through the PostgreSQL query result, extracts the team from the tags, and organizes the servers into a 
+    dictionary where each key is a team and the value is a list of lists with server names and Owner  owner is pulled from the tags and server is the key of dictionary passed in.
+    If debug is True, prints the resulting dictionary.
+    """
+    server_dict = {}
+    for server, details in pg_result.items():
+        tags = details[2] if len(details) > 1 else {}
+        team = tags.get('Team','').upper()
+        owner = tags.get('Owner','')
+        instance_type = details[1] if len(details) > 1 else ''
+        instance_id = details[0] if len(details) > 0 else ''
+        pro_core_cnt = details[3] if len(details) > 3 else ''
+        if server:
+            if server not in server_dict:
+                server_dict[server] = []
+            server_dict[server].append({'host': server, 'instance_id': instance_id, 'instance_type': instance_type, 'team': team, 'owner': owner, 'pro_core_cnt': pro_core_cnt}) 
+        else:
+            print(f"Warning: No team tag found for server {server}. Skipping.")
+    if debug:
+        for team, servers in server_dict.items():
+            print(f"{team}: {servers}")
+    return server_dict
+    
+
 def main():
     #servers = parse_ssh_config(SSH_CONFIG_PATH)
     start_time = time.time()
+    pg_aws_Query = """SELECT title, instance_id, instance_type, tags, cpu_options_core_count 
+                        FROM steampipe_cache.aws_ec2_instance 
+                        WHERE title LIKE 'TA-%' AND instance_state = 'running' AND tags NOTNULL ORDER BY title;"""
+    pg_ali_Query = """SELECT name, instance_id, instance_type, tags, cpu_options_core_count 
+                        FROM steampipe_cache.alicloud_ecs_instance 
+                        WHERE name LIKE 'AC-%' AND Status ='Running' AND tags NOTNULL ORDER BY name ;
+                    """
+    pgRunner= PostgresQueryRunner(PostgresQueryRunner.load_db_creds_from_file(".DBCreds.json"), logger=logging.getLogger(__name__))
+    serverDict2 = create_server_dict_from_pg_query_result(pgRunner.run_query(pg_ali_Query, key='name') | pgRunner.run_query(pg_aws_Query, key='title'))
+    team_dict = defaultdict(list)
+    team_dict = {}
+    for details_list in serverDict2.values():
+        for details in details_list:
+            team = details.get('team')
+            host = details.get('host')
+            if team:
+                team_dict.setdefault(team, []).append(host)
     
-    serverDict = {'MM':["TA-TKY-A-45", "TA-SEO-B-07"]}
-    serverDict = {'MM':["TA-SEO-B-07"]}
-    serverDict = create_server_dict_from_file('server_list_full.txt', debug=True)
     teamsList = sorted(["TAO", "OMNIA", "FZE", "ARB", "PD", "DEFI", "MM", "RWD", "OTC", "TAKE", "DLP", "DPDK"])
     all_server_rows = []
     user = 'archy'  # Replace with your username
-    server_AWS_details = get_all_servers_by_name_tag(owner_tag='Owner', debug=True)
-    server_ALI_details = fetch_ecs_inventory(ALI_ECS_INVENTORY_URL)
 
     # Build a flat list of (team_key, server) pairs across all teams.
     # This allows us to assign a globally unique 'num' index to each server, regardless of team.
     all_team_server_pairs = []
-    for team in teamsList:
-        team_key = team.upper()
-        if team_key not in serverDict:
-            print(f"team {team_key} not found in serverDict.")
-            continue
-        servers = serverDict[team_key]
-        for server in servers:
-            all_team_server_pairs.append((team_key, server))
-
+    team_to_servers = defaultdict(list)
+    
+    for servername, details in serverDict2.items():
+        team = details[0].get('team')
+        if team in teamsList:
+            team_to_servers[team].append(servername)
+            all_team_server_pairs.append((team, servername))
+        #check for shared servers and if a shared server add that name as a team
+        if '+' in team:
+            sub_teams = team.split('+')
+            for sub_team in sub_teams:
+                sub_team = sub_team.strip()
+                if sub_team in teamsList:
+                    team_to_servers[team].append(servername)
+                    all_team_server_pairs.append((team, servername))
+                    #only add the server once with the full team name (e.g., "TAO+OMNIA") but not with the individual sub-team names to avoid duplicates in the output. The full team name will be included in the 'team' column of the output CSV, and we can see which servers are shared by looking for team names that contain '+'. If we added the server multiple times under each sub-team, it would inflate the count of servers for those teams and make it harder to identify shared servers.
+                    break
+        
     # Enumerate globally so that 'num' is unique across all servers (not per team)
     with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
         future_to_idx_server = {
             # idx here is the global server number (1..N), not per-team
-            executor.submit(process_server, idx, server, team_key, user, server_AWS_details, server_ALI_details): (idx, server)
+            executor.submit(process_server, idx, server, team_key, user, serverDict2): (idx, server)
             for idx, (team_key, server) in enumerate(all_team_server_pairs, 1)
         }
         for future in concurrent.futures.as_completed(future_to_idx_server):
@@ -488,6 +501,7 @@ def main():
             if row:
                 all_server_rows.append(row)
     end_time = time.time() - start_time
+    print(f"Total servers to checked: {len(all_team_server_pairs)}")
     print(f"Completed in {end_time:.2f} seconds.")
     # Sort all_server_rows by the 'num' column (index 0)
     all_server_rows_sorted = sorted(all_server_rows, key=lambda x: x[0])
