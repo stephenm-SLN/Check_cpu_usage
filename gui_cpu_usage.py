@@ -301,7 +301,7 @@ def index():
             // Add Clear all filters button to the right of search box (only when filters are active)
             var hasFilters = Object.values(currentFiltersByCol).some(function(arr) { return arr.length > 0; });
             if (hasFilters) {
-                var clearBtn = $('<button type="submit" name="clear" value="1" class="btn btn-sm btn-outline-secondary clear-filters-btn">Clear all filters</button>');
+                var clearBtn = $('<button type="submit" name="clear" value="1" class="btn btn-sm btn-danger clear-filters-btn">Clear all filters</button>');
                 $('.dt-entries-search').append(clearBtn);
             }
             // Use capture phase so we run BEFORE DataTables - prevents sort when clicking filter icon
