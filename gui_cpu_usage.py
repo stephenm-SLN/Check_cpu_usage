@@ -57,8 +57,11 @@ def refresh():
     status, _, _ = get_refresh_status()
     if status != 'running':
         threading.Thread(target=run_refresh, daemon=True).start()
-    # Preserve filters and sort when redirecting
-    columns = pd.read_csv(CSV_FILE).columns.tolist()
+    # Preserve filters and sort when redirecting (skip if CSV doesn't exist yet)
+    try:
+        columns = pd.read_csv(CSV_FILE).columns.tolist()
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        columns = []
     params = []
     for col in columns:
         for v in request.form.getlist(f'filter_{col}'):
@@ -78,6 +81,32 @@ def get_filtered_data(filters=None):
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
+    # If CSV doesn't exist, trigger refresh and show waiting page
+    if not os.path.exists(CSV_FILE):
+        status, _, _ = get_refresh_status()
+        if status != 'running':
+            threading.Thread(target=run_refresh, daemon=True).start()
+        return render_template_string('''
+        <html>
+        <head><title>Threaded CPU Usage</title>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/css/bootstrap.min.css">
+        </head>
+        <body class="container mt-5">
+            <h1>Threaded CPU Usage</h1>
+            <p class="lead">No data file found. Running refresh to pull in data...</p>
+            <p>This page will reload automatically when the refresh completes.</p>
+            <script>
+            function poll() {
+                fetch('/status').then(r => r.json()).then(d => {
+                    if (d.status !== 'running') window.location.reload();
+                    else setTimeout(poll, 2000);
+                });
+            }
+            setTimeout(poll, 2000);
+            </script>
+        </body>
+        </html>
+        ''')
     df = pd.read_csv(CSV_FILE)
     refresh_status, last_refresh, refresh_error = get_refresh_status()
     columns = df.columns.tolist()
