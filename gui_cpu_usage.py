@@ -103,6 +103,10 @@ def index():
             <h1>Threaded CPU Usage</h1>
             <p class="lead">No data file found. Running refresh to pull in data...</p>
             <p>This page will reload automatically when the refresh completes.</p>
+            <div class="mt-3 text-muted" style="font-size: 12px;">
+                GUI Info: {gui_script} — {gui_path}<br>
+                API Info: {api_script} — {api_path}
+            </div>
             <script>
             function poll() {
                 fetch('/status')
@@ -117,7 +121,11 @@ def index():
             </script>
         </body>
         </html>
-        ''')
+        '''.format(
+            gui_script=os.path.basename(__file__),
+            gui_path=os.path.abspath(__file__),
+            api_script='check_cpu_usage.py',
+            api_path=os.path.abspath(os.path.join(LOCAL_DIR, 'check_cpu_usage.py'))))
     df = pd.read_csv(CSV_FILE)
     refresh_status, last_refresh, refresh_error = get_refresh_status()
     columns = df.columns.tolist()
@@ -431,10 +439,18 @@ def index():
             </table>
             </div>
             </form>
+            <div class="mt-3 text-muted" style="font-size: 12px;">
+                GUI Info: {{ gui_script }} — {{ gui_path }}<br>
+                API Info: {{ api_script }} — {{ api_path }}
+            </div>
         </div>
     </body>
     </html>
-    ''', columns=columns, filter_options=filter_options, filters=filters, filtered_df=filtered_df, sort_col=sort_col, sort_dir=sort_dir, refresh_status=refresh_status, last_refresh=last_refresh, refresh_error=refresh_error)
+    ''', columns=columns, filter_options=filter_options, filters=filters, filtered_df=filtered_df, sort_col=sort_col, sort_dir=sort_dir, refresh_status=refresh_status, last_refresh=last_refresh, refresh_error=refresh_error,
+        gui_script=os.path.basename(__file__),
+        gui_path=os.path.abspath(__file__),
+        api_script='check_cpu_usage.py',
+        api_path=os.path.abspath(os.path.join(LOCAL_DIR, 'check_cpu_usage.py')))
 
 if __name__ == '__main__':
     # Use debug=False with PM2 - debug mode's reloader can cause ERR_CONNECTION_RESET
