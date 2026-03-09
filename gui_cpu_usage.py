@@ -10,6 +10,10 @@ CSV_FILE = os.path.join(LOCAL_DIR, 'Threaded_cpu_usage.csv')
 
 REFRESH_STATUS_FILE = os.path.join(LOCAL_DIR, 'refresh_status.txt')
 
+# Columns that support threshold filters (show rows where value > X%)
+THRESHOLD_COLUMNS = {'%Busy_Socket0', '%Busy_Socket1', '%Free_Socket0', '%Free_Socket1'}
+THRESHOLD_OPTIONS = ['> 85%', '> 90%', '> 95%']
+
 app = Flask(__name__)
 @app.route('/status')
 def status():
@@ -83,8 +87,32 @@ def get_filtered_data(filters=None):
     df = pd.read_csv(CSV_FILE)
     if filters:
         for col, vals in filters.items():
-            if vals:
-                df = df[df[col].isin(vals)]
+            if not vals:
+                continue
+            # Separate threshold filters ("> 5%", etc.) from exact-match filters
+            threshold_vals = [v for v in vals if v in THRESHOLD_OPTIONS]
+            exact_vals = [v for v in vals if v not in THRESHOLD_OPTIONS]
+            if col in THRESHOLD_COLUMNS and threshold_vals:
+                # Parse threshold (e.g. "> 90%" -> 90) and keep rows where value > max(thresholds)
+                thresholds = []
+                for v in threshold_vals:
+                    try:
+                        n = float(v.replace('>', '').replace('%', '').strip())
+                        thresholds.append(n)
+                    except ValueError:
+                        pass
+                if thresholds:
+                    thresh = max(thresholds)
+                    numeric_col = pd.to_numeric(df[col], errors='coerce')
+                    thresh_mask = numeric_col > thresh
+                    if exact_vals:
+                        exact_mask = df[col].astype(str).isin(exact_vals)
+                        mask = thresh_mask | exact_mask
+                    else:
+                        mask = thresh_mask
+                    df = df[mask]
+            elif exact_vals:
+                df = df[df[col].astype(str).isin(exact_vals)]
     return df
 
 @app.route('/', methods=['GET', 'POST'])
@@ -130,7 +158,12 @@ def index():
     refresh_status, last_refresh, refresh_error = get_refresh_status()
     columns = df.columns.tolist()
     # Build filter options for each column
-    filter_options = {col: [str(val) for val in sorted(df[col].dropna().unique())] for col in columns}
+    filter_options = {}
+    for col in columns:
+        opts = [str(val) for val in sorted(df[col].dropna().unique())]
+        if col in THRESHOLD_COLUMNS:
+            opts = THRESHOLD_OPTIONS + opts
+        filter_options[col] = opts
     filters = {}
     clear = request.form.get('clear')
     for col in columns:
@@ -281,11 +314,35 @@ def index():
                 pageLength: 25,
                 stateSave: true,
                 stateSaveCallback: function(settings, data) {
+                    var scrollBody = $('#cpuTable').closest('.dataTables_scrollBody');
+                    if (scrollBody.length) {
+                        data.scrollLeft = scrollBody.scrollLeft();
+                    }
                     localStorage.setItem('DataTables_cpuTable', JSON.stringify(data));
                 },
                 stateLoadCallback: function(settings) {
                     var saved = localStorage.getItem('DataTables_cpuTable');
                     return saved ? JSON.parse(saved) : null;
+                },
+                initComplete: function(settings) {
+                    var scrollBody = $('#cpuTable').closest('.dataTables_scrollBody');
+                    if (scrollBody.length) {
+                        var scrollLeft = sessionStorage.getItem('cpuTable_scrollLeft');
+                        if (scrollLeft === null) {
+                            var saved = localStorage.getItem('DataTables_cpuTable');
+                            if (saved) {
+                                try {
+                                    var data = JSON.parse(saved);
+                                    scrollLeft = data.scrollLeft;
+                                } catch (e) {}
+                            }
+                        }
+                        if (scrollLeft !== null && scrollLeft !== undefined) {
+                            var pos = parseInt(scrollLeft, 10);
+                            setTimeout(function() { scrollBody.scrollLeft(pos); }, 0);
+                        }
+                        sessionStorage.removeItem('cpuTable_scrollLeft');
+                    }
                 },
                 dom: '<"row"<"col-sm-12"<"dt-entries-search"lf>>>rtip'
             });
@@ -298,12 +355,11 @@ def index():
             {% for col in columns %}
             currentFiltersByCol[{{loop.index0}}] = {{ filters[col]|tojson|safe }};
             {% endfor %}
-            // Add Clear all filters button to the right of search box (only when filters are active)
+            // Add Clear all filters button (always visible; red when filters are active)
             var hasFilters = Object.values(currentFiltersByCol).some(function(arr) { return arr.length > 0; });
-            if (hasFilters) {
-                var clearBtn = $('<button type="submit" name="clear" value="1" class="btn btn-sm btn-danger clear-filters-btn">Clear all filters</button>');
-                $('.dt-entries-search').append(clearBtn);
-            }
+            var clearBtn = $('<button type="submit" name="clear" value="1" class="btn btn-sm clear-filters-btn">Clear all filters</button>');
+            clearBtn.addClass(hasFilters ? 'btn-danger' : 'btn-outline-secondary');
+            $('.dt-entries-search').append(clearBtn);
             // Use capture phase so we run BEFORE DataTables - prevents sort when clicking filter icon
             document.addEventListener('click', function(event) {
                 var icon = event.target.closest && event.target.closest('.filter-icon');
@@ -330,8 +386,19 @@ def index():
                     $('#filterInputs').append(inp);
                 });
                 $('#filterPopupContainer').hide();
+                // Save scroll position before submit so it can be restored on reload
+                var scrollBody = $('#cpuTable').closest('.dataTables_scrollBody');
+                if (scrollBody.length) {
+                    sessionStorage.setItem('cpuTable_scrollLeft', scrollBody.scrollLeft());
+                }
                 $('#filterForm').submit();
             };
+            $('#filterForm').on('submit', function() {
+                var scrollBody = $('#cpuTable').closest('.dataTables_scrollBody');
+                if (scrollBody.length) {
+                    sessionStorage.setItem('cpuTable_scrollLeft', scrollBody.scrollLeft());
+                }
+            });
             window.showFilterDropdown = function(colIdx, colName, values, currentFilters, anchorEl) {
                 $('#filterPopupContainer').hide();
                 var el = anchorEl ? anchorEl : document.querySelector('#header_' + colIdx + ' .filter-icon, #header_' + colIdx);
@@ -425,7 +492,11 @@ def index():
                 </thead>
                 <tbody>
                     {% if filtered_df.shape[0] == 0 %}
-                    <tr><td colspan="{{columns|length}}" class="text-center">No data to display</td></tr>
+                    <tr>
+                        {% for col in columns %}
+                        <td class="text-center">{% if loop.first %}No data to display{% endif %}</td>
+                        {% endfor %}
+                    </tr>
                     {% else %}
                     {% for row in filtered_df.values.tolist() %}
                     <tr>
