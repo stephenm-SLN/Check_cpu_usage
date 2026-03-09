@@ -5,11 +5,9 @@ import threading
 import os
 import pandas as pd
 
-#PATH = '/home/archy/local/python_server/api_server/cpu_utilization/Check_cpu_usage/'
-PATH = '/Users/stephen.m/Documents/repos/python/check_cpu_usage'
-PATH = ''
-CSV_FILE = os.path.join(PATH, 'Threaded_cpu_usage.csv')
 LOCAL_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_FILE = os.path.join(LOCAL_DIR, 'Threaded_cpu_usage.csv')
+
 REFRESH_STATUS_FILE = os.path.join(LOCAL_DIR, 'refresh_status.txt')
 
 app = Flask(__name__)
@@ -37,12 +35,22 @@ def get_refresh_status():
 def run_refresh():
     import datetime
     set_refresh_status('running')
+    env = os.environ.copy()
+    env['REFRESH_STATUS_FILE'] = REFRESH_STATUS_FILE
     try:
         # Use conda run to execute the script in the 'check_cpu_usage' environment
-        result = subprocess.run([
-            'conda', 'run', '-n', 'check_cpu_usage', 'python',
-            os.path.join(PATH, 'check_cpu_usage.py')
-        ], capture_output=True, text=True)
+        # Pass REFRESH_STATUS_FILE so the script can update status when it finishes
+        # (handles PM2 restarts where the Flask thread may be killed before subprocess returns)
+        result = subprocess.run(
+            [
+                'conda', 'run', '-n', 'check_cpu_usage', 'python',
+                os.path.join(LOCAL_DIR, 'check_cpu_usage.py')
+            ],
+            capture_output=True,
+            text=True,
+            cwd=LOCAL_DIR,
+            env=env,
+        )
         dt = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         if result.returncode == 0:
             set_refresh_status('idle', dt)
@@ -97,10 +105,13 @@ def index():
             <p>This page will reload automatically when the refresh completes.</p>
             <script>
             function poll() {
-                fetch('/status').then(r => r.json()).then(d => {
-                    if (d.status !== 'running') window.location.reload();
-                    else setTimeout(poll, 2000);
-                });
+                fetch('/status')
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.status !== 'running') window.location.reload();
+                        else setTimeout(poll, 2000);
+                    })
+                    .catch(function() { setTimeout(poll, 2000); });
             }
             setTimeout(poll, 2000);
             </script>
@@ -347,6 +358,7 @@ def index():
         });
         // Auto-refresh when status changes from running to idle or error
         var lastStatus = '{{refresh_status}}';
+        var pollInterval = 2000;
         function pollRefreshStatus() {
             fetch('/status')
                 .then(response => response.json())
@@ -356,12 +368,16 @@ def index():
                         window.location.reload();
                     } else {
                         lastStatus = newStatus;
-                        setTimeout(pollRefreshStatus, 2000);
+                        setTimeout(pollRefreshStatus, pollInterval);
                     }
+                })
+                .catch(function(err) {
+                    // Connection reset, network error, etc. - retry after delay
+                    setTimeout(pollRefreshStatus, pollInterval);
                 });
         }
         if (lastStatus === 'running') {
-            setTimeout(pollRefreshStatus, 2000);
+            setTimeout(pollRefreshStatus, pollInterval);
         }
         </script>
     </head>
@@ -421,4 +437,6 @@ def index():
     ''', columns=columns, filter_options=filter_options, filters=filters, filtered_df=filtered_df, sort_col=sort_col, sort_dir=sort_dir, refresh_status=refresh_status, last_refresh=last_refresh, refresh_error=refresh_error)
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=8456)
+    # Use debug=False with PM2 - debug mode's reloader can cause ERR_CONNECTION_RESET
+    use_debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    app.run(debug=use_debug, host='0.0.0.0', port=8456, threaded=True)
