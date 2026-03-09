@@ -202,7 +202,7 @@ def index():
             }
             .table-responsive {
                 width: 100%;
-                overflow-x: auto;
+                overflow-x: visible;
             }
             table.table {
                 width: 100% !important;
