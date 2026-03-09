@@ -59,14 +59,31 @@ class PostgresQueryRunner:
             return {}
     
 
+def create_logger(name: str = __name__, log_file: str = "pgserver.log") -> logging.Logger:
+    """Create a logger that writes to both a file and stdout."""
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    if logger.handlers:
+        return logger
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh = logging.FileHandler(log_file, encoding='utf-8')
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+    return logger
+
+
 if __name__ == "__main__":
-     # Example usage
+    # Example usage
+    logger = create_logger(__name__)
     creds = PostgresQueryRunner.load_db_creds_from_file(".DBCreds.json")
-    runner = PostgresQueryRunner(creds, logger=logging.getLogger(__name__))
+    runner = PostgresQueryRunner(creds, logger=logger)
     query = "SELECT title, instance_type, tags FROM steampipe_cache.aws_ec2_instance WHERE title LIKE 'TA-%' AND instance_state = 'running' AND title IN ('TA-SEO-B-07');"
     result = runner.run_query(query, key='title')
     for key, values in result.items():
-        print(f"{key}: {values}") 
+        logger.info(f"{key}: {values}")
         for item, value in values[1].items():
-            print(f"  - {item}: {value}")  
+            logger.info(f"  - {item}: {value}")  
     

@@ -41,7 +41,7 @@ def run_refresh():
         # Use conda run to execute the script in the 'check_cpu_usage' environment
         result = subprocess.run([
             'conda', 'run', '-n', 'check_cpu_usage', 'python',
-            os.path.join(PATH, 'check_cpu_usage_threading_version.py')
+            os.path.join(PATH, 'check_cpu_usage.py')
         ], capture_output=True, text=True)
         dt = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         if result.returncode == 0:
