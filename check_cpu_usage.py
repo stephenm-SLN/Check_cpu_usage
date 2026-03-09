@@ -403,6 +403,23 @@ def create_server_dict_from_pg_query_result(
             logger.info(f"{team}: {servers}")
     return server_dict
 
+def _write_refresh_status(status: str, error: str = ''):
+    """Write refresh status file when invoked by GUI (REFRESH_STATUS_FILE env)."""
+    path = os.environ.get('REFRESH_STATUS_FILE')
+    if not path:
+        return
+    try:
+        import datetime
+        dt = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        line = f"{status}|{dt}"
+        if error:
+            line += f"|{error}"
+        with open(path, 'w') as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
 def main():
     logger = create_logger(__name__)
     start_time = time.time()
@@ -473,6 +490,7 @@ def main():
     # Write all results to CSV
     if len(all_server_rows_sorted) == 0:
         logger.warning("No server data collected. CSV file will not be created.")
+        _write_refresh_status('error', 'No server data collected')
         return
     with open(OUTPUT_CSV, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
@@ -485,6 +503,12 @@ def main():
         for row in all_server_rows_sorted:
             writer.writerow(row)
     logger.info(f"Results written to {OUTPUT_CSV}")
+    _write_refresh_status('idle')
+
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as e:
+        _write_refresh_status('error', str(e))
+        raise
