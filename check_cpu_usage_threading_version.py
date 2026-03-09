@@ -3,18 +3,14 @@ import csv
 import os
 import ast
 from typing import List, Dict
-import boto3
-import requests
 import concurrent.futures
 import time
-from pgserver import PostgresQueryRunner
-import re
 import logging
 from collections import defaultdict
+from pgserver import PostgresQueryRunner
 
 SSH_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config')
-OUTPUT_CSV = 'Threaded_cpu_usage.csv'
-ALI_ECS_INVENTORY_URL = 'http://inventory.devops.selini.tech/alicloud/ecs'  # Replace with actual URL
+OUTPUT_CSV = 'Threaded_cpu_usage.csv' # Replace with actual URL
 
 def parse_ssh_config(config_path: str) -> List[Dict[str, str]]:
     servers = []
@@ -39,7 +35,6 @@ def parse_ssh_config(config_path: str) -> List[Dict[str, str]]:
     servers = [h for h in servers if '*' not in h['server']]
     return servers
 
-import time
 def parse_cpu_list(cpu_list_str):
     # Parses CPU list like '2,3,5-7' into [2,3,5,6,7]
     cpus = set()
@@ -174,71 +169,6 @@ def create_server_dict_from_file(filename, debug=False):
         for k, v in ordered.items():
             print(f"{k}: {v}")
     return ordered
-
-def get_all_servers_by_name_tag(owner_tag='Owner', debug=False):
-    """
-    Returns a dict of AWS servers: {Name tag: [ {instance_id, instance_type, owner, aws_az}, ... ]} for all regions.
-    """
-    ec2 = boto3.client('ec2')
-    regions = [r['RegionName'] for r in ec2.describe_regions()['Regions']]
-    all_servers = {}
-    for region in regions:
-        ec2_reg = boto3.client('ec2', region_name=region)
-        paginator = ec2_reg.get_paginator('describe_instances')
-        for page in paginator.paginate():
-            for reservation in page['Reservations']:
-                for instance in reservation['Instances']:
-                    name = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), None)
-                    owner = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'].lower() == owner_tag.lower()), None)
-                    instance_id = instance['InstanceId']
-                    instance_type = instance['InstanceType']
-                    az = instance.get('Placement', {}).get('AvailabilityZone', None)
-                    if name:
-                        entry = {
-                            'instance_id': instance_id,
-                            'instance_type': instance_type,
-                            'owner': owner,
-                            'aws_az': az
-                        }
-                        if name not in all_servers:
-                            all_servers[name] = []
-                        all_servers[name].append(entry)
-                        if debug:
-                            print(f"{name}: {entry}")
-    return all_servers
-
-def fetch_ecs_inventory(url):
-    '''
-    Docstring for fetch_ali_ecs_inventory
-    retrieves ECS inventory from the given URL and processes it into a dictionary.
-    :param url: Description
-    '''
-    response = requests.get(url)
-    response.raise_for_status()
-    data = response.json()
-    result = {}
-    name_counts = {}
-    for item in data:
-        base_name = item.get('name')
-        tags = item.get('tags') or {}
-        entry = {
-            'role': tags.get('role', 'unknown'),
-            'team': tags.get('team', 'unknown'),
-            'instance_type': item.get('instance_type'),
-            'owner': tags.get('owner', tags.get('Owner', 'unknown')),
-            'exchange': tags.get('exchange', tags.get('Exchange', 'unknown')),
-            'environment': tags.get('environment', tags.get('Environment', 'unknown')),
-            'status': item.get('status'),
-        }
-        # Ensure unique key by appending -number if needed
-        if base_name not in name_counts:
-            name_counts[base_name] = 0
-            name = base_name
-        else:
-            name_counts[base_name] += 1
-            name = f"{base_name}-{name_counts[base_name]}"
-        result.setdefault(name, []).append(entry)
-    return result
 
 def parse_lscpu_output(lscpu_lines):
     import re
@@ -441,7 +371,6 @@ def create_server_dict_from_pg_query_result(pg_result, debug=False):
         for team, servers in server_dict.items():
             print(f"{team}: {servers}")
     return server_dict
-    
 
 def main():
     #servers = parse_ssh_config(SSH_CONFIG_PATH)
@@ -454,7 +383,9 @@ def main():
                         WHERE name LIKE 'AC-%' AND Status ='Running' AND tags NOTNULL ORDER BY name ;
                     """
     pgRunner= PostgresQueryRunner(PostgresQueryRunner.load_db_creds_from_file(".DBCreds.json"), logger=logging.getLogger(__name__))
-    serverDict2 = create_server_dict_from_pg_query_result(pgRunner.run_query(pg_ali_Query, key='name') | pgRunner.run_query(pg_aws_Query, key='title'))
+    aws = pgRunner.run_query(pg_aws_Query, key='title')
+    ali = pgRunner.run_query(pg_ali_Query, key='name')
+    serverDict2 = create_server_dict_from_pg_query_result(ali | aws)
     team_dict = defaultdict(list)
     team_dict = {}
     for details_list in serverDict2.values():
@@ -506,6 +437,9 @@ def main():
     # Sort all_server_rows by the 'num' column (index 0)
     all_server_rows_sorted = sorted(all_server_rows, key=lambda x: x[0])
     # Write all results to CSV
+    if len(all_server_rows_sorted) == 0:
+        print("No server data collected. CSV file will not be created.")
+        return
     with open(OUTPUT_CSV, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
