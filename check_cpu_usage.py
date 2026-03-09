@@ -2,7 +2,7 @@ import paramiko
 import csv
 import os
 import ast
-from typing import List, Dict
+from typing import List, Dict, Optional
 import concurrent.futures
 import time
 import logging
@@ -10,7 +10,36 @@ from collections import defaultdict
 from pgserver import PostgresQueryRunner
 
 SSH_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config')
-OUTPUT_CSV = 'Threaded_cpu_usage.csv' # Replace with actual URL
+OUTPUT_CSV = 'Threaded_cpu_usage.csv'  # Replace with actual URL
+LOG_FILE = os.path.join(os.path.dirname(__file__), 'check_cpu_usage.log')
+
+
+def create_logger(
+    name: str = __name__,
+    log_file: Optional[str] = None,
+    level: int = logging.INFO,
+) -> logging.Logger:
+    """Create a logger that writes to both a file and stdout."""
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    # Avoid adding handlers multiple times if logger already configured
+    if logger.handlers:
+        return logger
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    # File handler
+    file_path = log_file or LOG_FILE
+    fh = logging.FileHandler(file_path, encoding='utf-8')
+    fh.setLevel(level)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    # Stdout handler
+    sh = logging.StreamHandler()
+    sh.setLevel(level)
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+    return logger
 
 def parse_ssh_config(config_path: str) -> List[Dict[str, str]]:
     servers = []
@@ -48,7 +77,9 @@ def parse_cpu_list(cpu_list_str):
             cpus.add(int(part))
     return sorted(cpus)
 
-def get_cpu_idle_status(servername: str, ssh, isolated) -> List[Dict[str, str]]:
+def get_cpu_idle_status(
+    servername: str, ssh, isolated, logger: Optional[logging.Logger] = None
+) -> List[Dict[str, str]]:
     results = []
     try:
         '''
@@ -128,11 +159,12 @@ def get_cpu_idle_status(servername: str, ssh, isolated) -> List[Dict[str, str]]:
             })
         ssh.close()
     except Exception as e:
-        print(f"Error connecting to {servername}: {e}")
+        if logger:
+            logger.error(f"Error connecting to {servername}: {e}")
         results.append({'server': servername, 'cpu': '', 'isolated': '', 'status': f'SSH connect ERROR: {e}'})
-    return results 
+    return results
 
-def create_server_dict_from_file(filename, debug=False):
+def create_server_dict_from_file(filename, debug=False, logger: Optional[logging.Logger] = None):
     """
     Reads a text file where each line is 'key,[list of servers]' and returns a dictionary.
     If debug is True, prints the resulting dictionary.
@@ -161,13 +193,13 @@ def create_server_dict_from_file(filename, debug=False):
                     else:
                         server_dict[key_upper] = server_list
             except Exception as e:
-                if debug:
-                    print(f"Error parsing line: {line} ({e})")
+                if debug and logger:
+                    logger.warning(f"Error parsing line: {line} ({e})")
     # Sort keys and return OrderedDict
     ordered = OrderedDict(sorted(server_dict.items()))
-    if debug:
+    if debug and logger:
         for k, v in ordered.items():
-            print(f"{k}: {v}")
+            logger.info(f"{k}: {v}")
     return ordered
 
 def parse_lscpu_output(lscpu_lines):
@@ -208,14 +240,20 @@ def parse_lscpu_output(lscpu_lines):
 
     return sockets, socket_cpu_sets, iso_cpus
 
-def process_server(idx, servername, team_key, user, serverDict_details): #server_AWS_details, server_ALI_details):
+def process_server(
+    idx, servername, team_key, user, serverDict_details,
+    logger: Optional[logging.Logger] = None
+):
     if servername[:3].upper() != 'TA-' and servername[:3].upper() != 'AC-':
-        print(f"Skipping {servername} as it does not start with 'TA-' or 'AC-'.")
+        if logger:
+            logger.info(f"Skipping {servername} as it does not start with 'TA-' or 'AC-'.")
         return None
-    print(f"Checking {servername} ({team_key}) as {user}...")
+    if logger:
+        logger.info(f"Checking {servername} ({team_key}) as {user}...")
     results = []
     if servername == 'TA-TKY-FIX-A-01':
-        print(f"Skipping {servername} due to known SSH issues.")
+        if logger:
+            logger.info(f"Skipping {servername} due to known SSH issues.")
     # Get CPUs per socket using lscpu -e
     #lscpu_cmd = "lscpu -e=CPU,SOCKET | awk 'NR>1 {print $1, $2}'"
     lscpu_cmd = "lscpu | grep -E 'Socket|NUMA'"
@@ -239,9 +277,10 @@ def process_server(idx, servername, team_key, user, serverDict_details): #server
             Current get_cpu_idle_status checks for isolated CPUs but does not group by socket, so we need to determine which CPUs belong to which socket and then calculate busy/idle percentages per socket.
             If no isocpus are found, we check all CPUs and group them by socket using the lscpu output. Then we can calculate the percentage of busy and idle CPUs for each socket and include that in the final output.
         '''
-        results = get_cpu_idle_status(servername,ssh, iso_cpus)
+        results = get_cpu_idle_status(servername, ssh, iso_cpus, logger=logger)
         if results and 'ERROR' in results[0]['status']:
-            print(f"Error checking {servername}: {results[0]['status']}")
+            if logger:
+                logger.error(f"Error checking {servername}: {results[0]['status']}")
             row = [idx, servername, '', team_key, '', '', '', '', '', '', '', '', results[0]['status'], '', '', '']
             return row   
         
@@ -251,20 +290,9 @@ def process_server(idx, servername, team_key, user, serverDict_details): #server
         
         socket0_set = socket_cpu_sets.get(0, set())
         socket1_set = socket_cpu_sets.get(1, set())
-        '''
-        for line in cpu_socket_lines:
-            if not line.strip():
-                continue
-            cpu_str, socket_str = line.strip().split()
-            cpu = int(cpu_str)
-            socket = int(socket_str)
-            if socket == 0:
-                socket0_set.add(cpu)
-            elif socket == 1:
-                socket1_set.add(cpu)
-        '''
     except Exception as e:
-        print(f"Error connecting to {servername}: {e}")
+        if logger:
+            logger.error(f"Error connecting to {servername}: {e}")
         results.append({'server': servername, 'cpu': '', 'isolated': '', 'status': f'SSH connect ERROR: {e}'})
         status = results[0]['status'] if results else f'SSH connect ERROR: {e}'
         row = [idx, servername, '', team_key, '', '', '', '', '', '', '', '', status, '', '', '']
@@ -333,18 +361,20 @@ def process_server(idx, servername, team_key, user, serverDict_details): #server
         ','.join(busy_socket0), ','.join(busy_socket1),
         ','.join(idle_socket0), ','.join(idle_socket1)
     ]
-    # Print to stdout with safe formatting
-    def fmt(val):
-        return f'{val:.2f}' if isinstance(val, float) else val
-    print(f"{idx}, {servername}, {aws_az}, {team_key}, owner: {owner}, instance_type: {instance_type}, "
-          f"sockets: {sockets}, iso_cpus: {iso_cpus}, "
-          f"%Busy_Socket0: {fmt(percent_busy_socket0)}, %Busy_Socket1: {fmt(percent_busy_socket1)}, "
-          f"%Free_Socket0: {fmt(percent_free_socket0)}, %Free_Socket1: {fmt(percent_free_socket1)}, "
-          f"Busy_Socket0: {','.join(busy_socket0)}, Busy_Socket1: {','.join(busy_socket1)}, "
-          f"Free_Socket0: {','.join(idle_socket0)}, Free_Socket1: {','.join(idle_socket1)}")
+    if logger:
+        logger.info(
+            f"{idx}, {servername}, {aws_az}, {team_key}, owner: {owner}, instance_type: {instance_type}, "
+            f"sockets: {sockets}, iso_cpus: {iso_cpus}, "
+            f"%Busy_Socket0: {fmt(percent_busy_socket0)}, %Busy_Socket1: {fmt(percent_busy_socket1)}, "
+            f"%Free_Socket0: {fmt(percent_free_socket0)}, %Free_Socket1: {fmt(percent_free_socket1)}, "
+            f"Busy_Socket0: {','.join(busy_socket0)}, Busy_Socket1: {','.join(busy_socket1)}, "
+            f"Free_Socket0: {','.join(idle_socket0)}, Free_Socket1: {','.join(idle_socket1)}"
+        )
     return row
 
-def create_server_dict_from_pg_query_result(pg_result, debug=False):
+def create_server_dict_from_pg_query_result(
+    pg_result, debug=False, logger: Optional[logging.Logger] = None
+):
     """
     Transforms the PostgreSQL query result into a dictionary of the form {team_key: [[{host:server1},{owner:owner1}], [{host:server2},{owner:owner2}], ...]]}.
     The team_key is derived from the tags which is list of dictionaries. Team  (e.g., 'TA-SEO-B-07' -> 'SEO').
@@ -364,16 +394,17 @@ def create_server_dict_from_pg_query_result(pg_result, debug=False):
         if server:
             if server not in server_dict:
                 server_dict[server] = []
-            server_dict[server].append({'host': server, 'instance_id': instance_id, 'instance_type': instance_type, 'team': team, 'owner': owner, 'pro_core_cnt': pro_core_cnt}) 
+            server_dict[server].append({'host': server, 'instance_id': instance_id, 'instance_type': instance_type, 'team': team, 'owner': owner, 'pro_core_cnt': pro_core_cnt})
         else:
-            print(f"Warning: No team tag found for server {server}. Skipping.")
-    if debug:
+            if logger:
+                logger.warning(f"Warning: No team tag found for server {server}. Skipping.")
+    if debug and logger:
         for team, servers in server_dict.items():
-            print(f"{team}: {servers}")
+            logger.info(f"{team}: {servers}")
     return server_dict
 
 def main():
-    #servers = parse_ssh_config(SSH_CONFIG_PATH)
+    logger = create_logger(__name__)
     start_time = time.time()
     pg_aws_Query = """SELECT title, instance_id, instance_type, tags, cpu_options_core_count 
                         FROM steampipe_cache.aws_ec2_instance 
@@ -382,10 +413,13 @@ def main():
                         FROM steampipe_cache.alicloud_ecs_instance 
                         WHERE name LIKE 'AC-%' AND Status ='Running' AND tags NOTNULL ORDER BY name ;
                     """
-    pgRunner= PostgresQueryRunner(PostgresQueryRunner.load_db_creds_from_file(".DBCreds.json"), logger=logging.getLogger(__name__))
+    pgRunner = PostgresQueryRunner(
+        PostgresQueryRunner.load_db_creds_from_file(".DBCreds.json"),
+        logger=logger
+    )
     aws = pgRunner.run_query(pg_aws_Query, key='title')
     ali = pgRunner.run_query(pg_ali_Query, key='name')
-    serverDict2 = create_server_dict_from_pg_query_result(ali | aws)
+    serverDict2 = create_server_dict_from_pg_query_result(ali | aws, logger=logger)
     team_dict = defaultdict(list)
     team_dict = {}
     for details_list in serverDict2.values():
@@ -424,7 +458,7 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
         future_to_idx_server = {
             # idx here is the global server number (1..N), not per-team
-            executor.submit(process_server, idx, server, team_key, user, serverDict2): (idx, server)
+            executor.submit(process_server, idx, server, team_key, user, serverDict2, logger): (idx, server)
             for idx, (team_key, server) in enumerate(all_team_server_pairs, 1)
         }
         for future in concurrent.futures.as_completed(future_to_idx_server):
@@ -432,13 +466,13 @@ def main():
             if row:
                 all_server_rows.append(row)
     end_time = time.time() - start_time
-    print(f"Total servers to checked: {len(all_team_server_pairs)}")
-    print(f"Completed in {end_time:.2f} seconds.")
+    logger.info(f"Total servers to checked: {len(all_team_server_pairs)}")
+    logger.info(f"Completed in {end_time:.2f} seconds.")
     # Sort all_server_rows by the 'num' column (index 0)
     all_server_rows_sorted = sorted(all_server_rows, key=lambda x: x[0])
     # Write all results to CSV
     if len(all_server_rows_sorted) == 0:
-        print("No server data collected. CSV file will not be created.")
+        logger.warning("No server data collected. CSV file will not be created.")
         return
     with open(OUTPUT_CSV, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
@@ -450,7 +484,7 @@ def main():
         ])
         for row in all_server_rows_sorted:
             writer.writerow(row)
-    print(f"Results written to {OUTPUT_CSV}")
+    logger.info(f"Results written to {OUTPUT_CSV}")
 
 if __name__ == '__main__':
     main()
