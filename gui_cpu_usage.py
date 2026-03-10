@@ -12,7 +12,7 @@ REFRESH_STATUS_FILE = os.path.join(LOCAL_DIR, 'refresh_status.txt')
 
 # Columns that support threshold filters (show rows where value > X%)
 THRESHOLD_COLUMNS = {'%Busy_Socket0', '%Busy_Socket1', '%Free_Socket0', '%Free_Socket1'}
-THRESHOLD_OPTIONS = ['> 85%', '> 90%', '> 95%']
+THRESHOLD_OPTIONS = ['>50%', '>75%', '> 85%', '> 90%', '> 95%']
 
 app = Flask(__name__)
 @app.route('/status')
@@ -409,9 +409,13 @@ def index():
                     var escapedVal = ('' + val).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
                     checkboxesHtml += '<label><input type="checkbox" class="filter-checkbox" value="' + escapedVal + '"' + checked + '> ' + escapedVal + '</label>';
                 });
+                var clearBtnHtml = currentFilters.length > 0
+                    ? "<button type='button' class='btn btn-sm btn-outline-danger mr-1' onclick='clearColumnFilter(" + colIdx + ")'>Clear filter</button> "
+                    : "";
                 var popupHtml = "<div style='font-weight:600;margin-bottom:6px;'>Filter " + colName + "</div>" +
                     "<div class='filter-popup-checkboxes'>" + checkboxesHtml + "</div>" +
-                    "<div class='mt-2'><button type='button' class='btn btn-sm btn-primary' onclick='applyFilterFromPopup(" + colIdx + ")'>Apply</button> " +
+                    "<div class='mt-2'>" + clearBtnHtml +
+                    "<button type='button' class='btn btn-sm btn-primary' onclick='applyFilterFromPopup(" + colIdx + ")'>Apply</button> " +
                     "<button type='button' class='btn btn-sm btn-secondary' onclick='hideFilterDropdown()'>Close</button></div>";
                 $('#filterPopupContainer').html(popupHtml);
                 var minW = Math.max(rect.width || 0, 180);
@@ -424,6 +428,16 @@ def index():
             };
             window.hideFilterDropdown = function() {
                 $('#filterPopupContainer').hide();
+            };
+            window.clearColumnFilter = function(colIdx) {
+                var colName = columns[colIdx];
+                $('#filterInputs input').filter(function() { return $(this).attr('name') === 'filter_' + colName; }).remove();
+                $('#filterPopupContainer').hide();
+                var scrollBody = $('#cpuTable').closest('.dataTables_scrollBody');
+                if (scrollBody.length) {
+                    sessionStorage.setItem('cpuTable_scrollLeft', scrollBody.scrollLeft());
+                }
+                $('#filterForm').submit();
             };
             $(document).on('mousedown', function(event) {
                 if (!$(event.target).closest('#filterPopupContainer, .filter-icon').length) {
