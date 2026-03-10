@@ -81,6 +81,17 @@ if __name__ == "__main__":
     creds = PostgresQueryRunner.load_db_creds_from_file(".DBCreds.json")
     runner = PostgresQueryRunner(creds, logger=logger)
     query = "SELECT title, instance_type, tags FROM steampipe_cache.aws_ec2_instance WHERE title LIKE 'TA-%' AND instance_state = 'running' AND title IN ('TA-SEO-B-07');"
+    pg_aws_Query = """SELECT title, instance_id, instance_type, tags, cpu_options_core_count 
+                        FROM steampipe_cache.aws_ec2_instance 
+                        WHERE title LIKE 'TA-%' AND instance_state = 'running' AND tags NOTNULL ORDER BY title;"""
+    pg_ali_Query = """SELECT name, instance_id, instance_type, tags, cpu_options_core_count 
+                        FROM steampipe_cache.alicloud_ecs_instance 
+                        WHERE name LIKE 'AC-%' AND Status ='Running' AND tags NOTNULL ORDER BY name ;
+                    """
+    aws = runner.run_query(pg_aws_Query, key='title')
+    ali = runner.run_query(pg_ali_Query, key='name')
+    result = aws | ali
+    
     result = runner.run_query(query, key='title')
     for key, values in result.items():
         logger.info(f"{key}: {values}")
