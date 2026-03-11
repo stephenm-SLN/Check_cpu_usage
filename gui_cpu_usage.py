@@ -1,4 +1,4 @@
-from flask import Flask, render_template_string, request, redirect, url_for
+from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 from urllib.parse import urlencode
 import subprocess
 import threading
@@ -83,6 +83,83 @@ def refresh():
     query = urlencode(params)
     return redirect(url_for('index') + ('?' + query))
 
+CHART_THRESHOLDS = [50, 75, 85, 95]
+
+
+def _to_numeric(series):
+    """Convert series to numeric, non-numeric become NaN."""
+    return pd.to_numeric(series, errors='coerce')
+
+
+def _compute_chart_data(df, threshold, free0, free1, busy0, busy1):
+    """Compute counts by (team, AZ) for rows meeting threshold criteria."""
+    mask = pd.Series([True] * len(df), index=df.index)
+    if free0 is not None:
+        mask = mask & (_to_numeric(df['%Free_Socket0']) > threshold)
+    if free1 is not None:
+        mask = mask & (_to_numeric(df['%Free_Socket1']) > threshold)
+    if busy0 is not None:
+        mask = mask & (_to_numeric(df['%Busy_Socket0']) > threshold)
+    if busy1 is not None:
+        mask = mask & (_to_numeric(df['%Busy_Socket1']) > threshold)
+    filtered = df[mask].copy()
+    filtered['AZ'] = filtered['AZ'].fillna('').astype(str)
+    filtered['team'] = filtered['team'].fillna('').astype(str)
+    filtered = filtered[filtered['AZ'].str.strip() != '']
+    counts = filtered.groupby(['team', 'AZ']).size().reset_index(name='count')
+    return counts
+
+
+@app.route('/chart-data')
+def chart_data():
+    """Return chart data for summary charts. Query params: threshold (50-95)."""
+    import sys
+    print('[chart_data] route hit', file=sys.stderr)
+    if not os.path.exists(CSV_FILE):
+        print('[chart_data] early return: CSV not found', file=sys.stderr)
+        return jsonify({'teams': [], 'azs': [], 'charts': {}})
+    try:
+        df = pd.read_csv(CSV_FILE)
+        if 'team' not in df.columns or 'AZ' not in df.columns:
+            print('[chart_data] early return: missing team/AZ columns', file=sys.stderr)
+            return jsonify({'teams': [], 'azs': [], 'charts': {}})
+    except Exception as e:
+        print('[chart_data] early return: read_csv failed:', e, file=sys.stderr)
+        return jsonify({'teams': [], 'azs': [], 'charts': {}})
+    threshold = int(request.args.get('threshold', 50))
+    if threshold not in CHART_THRESHOLDS:
+        threshold = 50
+    print('[chart_data] calling _compute_chart_data, df rows:', len(df), file=sys.stderr)
+    # Chart 1: %Free both sockets; 2: %Free Socket0; 3: %Free Socket1
+    # Chart 4: %Busy both; 5: %Busy Socket0; 6: %Busy Socket1
+    c1 = _compute_chart_data(df, threshold, free0=True, free1=True, busy0=None, busy1=None)
+    c2 = _compute_chart_data(df, threshold, free0=True, free1=None, busy0=None, busy1=None)
+    c3 = _compute_chart_data(df, threshold, free0=None, free1=True, busy0=None, busy1=None)
+    c4 = _compute_chart_data(df, threshold, free0=None, free1=None, busy0=True, busy1=True)
+    c5 = _compute_chart_data(df, threshold, free0=None, free1=None, busy0=True, busy1=None)
+    c6 = _compute_chart_data(df, threshold, free0=None, free1=None, busy0=None, busy1=True)
+    teams = sorted(df['team'].fillna('').astype(str).unique())
+    teams = [t for t in teams if t.strip()]
+    azs = sorted(df['AZ'].fillna('').astype(str).unique())
+    azs = [a for a in azs if a.strip()]
+
+    def to_matrix(counts_df):
+        m = {}
+        for _, r in counts_df.iterrows():
+            m[(r['team'], r['AZ'])] = int(r['count'])
+        return [[m.get((t, a), 0) for t in teams] for a in azs]
+
+    return jsonify({
+        'teams': teams,
+        'azs': azs,
+        'threshold': threshold,
+        'charts': {
+            1: to_matrix(c1), 2: to_matrix(c2), 3: to_matrix(c3),
+            4: to_matrix(c4), 5: to_matrix(c5), 6: to_matrix(c6),
+        }
+    })
+
+
 def get_filtered_data(filters=None):
     df = pd.read_csv(CSV_FILE)
     if filters:
@@ -123,7 +200,8 @@ def index():
         if status != 'running':
             threading.Thread(target=run_refresh, daemon=True).start()
         return render_template_string('''
-        <html>
+<!DOCTYPE html>
+<html lang="en">
         <head><title>Threaded CPU Usage</title>
         <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/css/bootstrap.min.css">
         </head>
@@ -178,8 +256,11 @@ def index():
         filtered_df = filtered_df.sort_values(by=sort_col, ascending=(sort_dir=='asc'))
     # Custom table rendering with filter dropdowns in header row
     return render_template_string('''
-    <html>
+<!DOCTYPE html>
+<html lang="en">
     <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Threaded CPU Usage</title>
         <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/css/bootstrap.min.css">
         <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
@@ -299,8 +380,64 @@ def index():
             .clear-filters-btn {
                 margin-left: 10px;
             }
+            .summary-matrix {
+                overflow-x: auto;
+                overflow-y: visible;
+            }
+            .summary-matrix table {
+                font-size: 9px;
+                width: 100%;
+                border-collapse: collapse;
+                table-layout: auto;
+            }
+            .summary-matrix th, .summary-matrix td {
+                border: 1px solid #ddd;
+                padding: 2px 6px;
+                text-align: center;
+            }
+            .summary-matrix th:first-child {
+                width: 1px;
+                white-space: nowrap;
+                background: #f5f5f5;
+                font-weight: 600;
+            }
+            .summary-matrix td.az-cell {
+                width: 1px;
+                white-space: nowrap;
+                text-align: left;
+                font-weight: 500;
+            }
+            .summary-matrix th:not(:first-child) {
+                width: 4.5ch;
+                max-width: 4.5ch;
+                background: #f5f5f5;
+                font-weight: 600;
+                white-space: normal;
+                word-wrap: break-word;
+                overflow-wrap: break-word;
+            }
+            .summary-matrix td:not(.az-cell) {
+                width: 4.5ch;
+                max-width: 4.5ch;
+                white-space: normal;
+                word-wrap: break-word;
+                overflow-wrap: break-word;
+            }
+            .nav-tabs .nav-link { color: #6c757d; }
+            .nav-tabs .nav-link.active { color: #007bff; }
+            .nav-tabs-row1 .nav-link, .nav-tabs-row2 .nav-link {
+                font-size: 12px;
+                padding: 6px 12px;
+                color: #6c757d;
+            }
+            .nav-tabs-row1 .nav-link.active, .nav-tabs-row2 .nav-link.active {
+                color: #007bff;
+            }
+            .summary-matrix .val-green { color: green; }
+            .summary-matrix .val-red { color: red; }
         </style>
         <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/js/bootstrap.bundle.min.js"></script>
         <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
         <script>
         $(function() {
@@ -325,6 +462,8 @@ def index():
                     return saved ? JSON.parse(saved) : null;
                 },
                 initComplete: function(settings) {
+                    $('.dataTables_filter input').attr('id', 'tableSearch').attr('name', 'tableSearch');
+                    $('.dataTables_length select').attr('id', 'tableLength').attr('name', 'tableLength');
                     var scrollBody = $('#cpuTable').closest('.dataTables_scrollBody');
                     if (scrollBody.length) {
                         var scrollLeft = sessionStorage.getItem('cpuTable_scrollLeft');
@@ -381,8 +520,8 @@ def index():
                 });
                 // Update hidden inputs for this column
                 $('#filterInputs input').filter(function() { return $(this).attr('name') === 'filter_' + colName; }).remove();
-                checked.forEach(function(val) {
-                    var inp = $('<input type="hidden">').attr('name', 'filter_' + colName).val(val);
+                checked.forEach(function(val, idx) {
+                    var inp = $('<input type="hidden">').attr('id', 'filterPopup_' + colName.replace(/%/g,'pct').replace(/ /g,'_') + '_' + idx).attr('name', 'filter_' + colName).val(val);
                     $('#filterInputs').append(inp);
                 });
                 $('#filterPopupContainer').hide();
@@ -468,10 +607,74 @@ def index():
         if (lastStatus === 'running') {
             setTimeout(pollRefreshStatus, pollInterval);
         }
+        var chartDataUrl = {{ chart_data_url|tojson }};
+        var chartLabels = {1: '%Free Socket0 & 1', 2: '%Free Socket0', 3: '%Free Socket1', 4: '%Busy Socket0 & 1', 5: '%Busy Socket0', 6: '%Busy Socket1'};
+        function renderChart(c, data, threshold) {
+            var el = document.getElementById('chart' + c);
+            if (!el) return;
+            var teams = data.teams || [];
+            var azs = data.azs || [];
+            if (teams.length === 0) teams = ['(no team data)'];
+            if (azs.length === 0) azs = ['(no AZ data)'];
+            var matrix = data.charts && data.charts[c] || [];
+            var valClass = (c <= 3) ? 'val-green' : 'val-red';
+            var colTotals = teams.map(function() { return 0; });
+            azs.forEach(function(az, azIdx) {
+                var row = matrix[azIdx] || [];
+                teams.forEach(function(team, teamIdx) {
+                    var count = (row[teamIdx] !== undefined) ? row[teamIdx] : 0;
+                    colTotals[teamIdx] += count;
+                });
+            });
+            var order = teams.map(function(_, i) { return i; }).sort(function(a, b) { return colTotals[b] - colTotals[a]; });
+            var html = '<table class="table table-sm table-bordered"><thead><tr><th>AZ</th>';
+            order.forEach(function(i) { html += '<th>' + teams[i] + '</th>'; });
+            html += '</tr></thead><tbody>';
+            azs.forEach(function(az, azIdx) {
+                var row = matrix[azIdx] || [];
+                html += '<tr><td class="az-cell">' + az + ' total</td>';
+                order.forEach(function(i) {
+                    var count = (row[i] !== undefined) ? row[i] : 0;
+                    var cellClass = (count !== 0) ? ' class="' + valClass + '"' : '';
+                    html += '<td' + cellClass + '>' + count + '</td>';
+                });
+                html += '</tr>';
+            });
+            html += '<tr><td class="az-cell"><strong>Total</strong></td>';
+            order.forEach(function(i) {
+                var t = colTotals[i];
+                var cellClass = (t !== 0) ? ' class="' + valClass + '"' : '';
+                html += '<td' + cellClass + '><strong>' + t + '</strong></td>';
+            });
+            var sumTotals = colTotals.reduce(function(a, b) { return a + b; }, 0);
+            var label = (chartLabels[c] || '') + ' &gt; ' + (threshold || '') + '%: ';
+            html += '<tr><td class="az-cell" colspan="' + (teams.length + 1) + '"><strong>' + label + '</strong><span class="' + valClass + '"><strong>' + sumTotals + '</strong></span></td></tr>';
+            html += '</tbody></table>';
+            el.innerHTML = html;
+        }
+        function loadCharts() {
+            var promises = [];
+            for (var c = 1; c <= 6; c++) {
+                (function(chartNum) {
+                    var thresh = $('.chart-threshold[data-chart="' + chartNum + '"]').val();
+                    var url = chartDataUrl + (chartDataUrl.indexOf('?') >= 0 ? '&' : '?') + 'threshold=' + thresh + '&_=' + Date.now();
+                    promises.push($.ajax({ url: url, cache: false }).then(function(data) { renderChart(chartNum, data, thresh); }));
+                })(c);
+            }
+            $.when.apply($, promises).fail(function() { console.error('Failed to load chart data'); });
+        }
+        $(document).on('change', '.chart-threshold', loadCharts);
+        $('a[href="#tabSummary"]').on('shown.bs.tab', function() {
+            setTimeout(loadCharts, 150);
+        });
+        $('a[href="#tabSummary"]').on('click', function() {
+            setTimeout(loadCharts, 200);
+        });
+        setTimeout(loadCharts, 300);
         </script>
     </head>
     <body>
-        <button type="submit" form="filterForm" formaction="/refresh" class="btn refresh-btn" style="background-color:white;border:1px solid #ccc;{% if refresh_status == 'running' %}color:red;{% endif %}">
+        <button type="submit" form="filterForm" formaction="/refresh" name="refresh" id="refreshBtn" class="btn refresh-btn" style="background-color:white;border:1px solid #ccc;{% if refresh_status == 'running' %}color:red;{% endif %}">
             {% if refresh_status == 'running' %}Running...{% else %}Refresh Data{% endif %}
         </button>
         <div class="refresh-status">
@@ -485,15 +688,21 @@ def index():
         <div id="filterPopupContainer" style="display:none;"></div>
         <div class="container">
             <h1>Threaded CPU Usage</h1>
+            <ul class="nav nav-tabs mb-3" role="tablist">
+                <li class="nav-item"><a class="nav-link active" data-toggle="tab" href="#tabTable">Table</a></li>
+                <li class="nav-item"><a class="nav-link" data-toggle="tab" href="#tabSummary">Summary</a></li>
+            </ul>
+            <div class="tab-content">
+            <div id="tabTable" class="tab-pane active">
             <form method="post" action="/" id="filterForm">
             <div id="filterInputs">
                 {% for col in columns %}
                 {% for v in filters[col] %}
-                <input type="hidden" name="filter_{{col}}" value="{{v}}">
+                <input type="hidden" id="filter_{{col|replace('%','pct')|replace(' ','_')}}_{{loop.index}}" name="filter_{{col}}" value="{{v}}">
                 {% endfor %}
                 {% endfor %}
-                <input type="hidden" name="sort_col" value="{{ sort_col or '' }}">
-                <input type="hidden" name="sort_dir" value="{{ sort_dir or 'asc' }}">
+                <input type="hidden" id="sort_col" name="sort_col" value="{{ sort_col or '' }}">
+                <input type="hidden" id="sort_dir" name="sort_dir" value="{{ sort_dir or 'asc' }}">
             </div>
             <div class="table-responsive">
             <table class="table table-striped" id="cpuTable">
@@ -524,6 +733,46 @@ def index():
             </table>
             </div>
             </form>
+            </div>
+            <div id="tabSummary" class="tab-pane">
+                <div class="row mb-3">
+                    <div class="col-12">
+                        <div class="card">
+                            <div class="card-body p-2">
+                                <ul class="nav nav-tabs nav-tabs-row1" role="tablist">
+                                    <li class="nav-item"><a class="nav-link active" data-toggle="tab" href="#summaryFree01">%Free Socket0 &amp; 1</a></li>
+                                    <li class="nav-item"><a class="nav-link" data-toggle="tab" href="#summaryFree0">%Free Socket0</a></li>
+                                    <li class="nav-item"><a class="nav-link" data-toggle="tab" href="#summaryFree1">%Free Socket1</a></li>
+                                </ul>
+                                <div class="tab-content mt-2">
+                                    <div id="summaryFree01" class="tab-pane active"><div class="d-flex justify-content-start align-items-center mb-1"><select class="chart-threshold form-control form-control-sm" data-chart="1" style="width:auto;"><option value="50">&gt; 50%</option><option value="75">&gt; 75%</option><option value="85">&gt; 85%</option><option value="95">&gt; 95%</option></select></div><div id="chart1" class="summary-matrix"></div></div>
+                                    <div id="summaryFree0" class="tab-pane"><div class="d-flex justify-content-start align-items-center mb-1"><select class="chart-threshold form-control form-control-sm" data-chart="2" style="width:auto;"><option value="50">&gt; 50%</option><option value="75">&gt; 75%</option><option value="85">&gt; 85%</option><option value="95">&gt; 95%</option></select></div><div id="chart2" class="summary-matrix"></div></div>
+                                    <div id="summaryFree1" class="tab-pane"><div class="d-flex justify-content-start align-items-center mb-1"><select class="chart-threshold form-control form-control-sm" data-chart="3" style="width:auto;"><option value="50">&gt; 50%</option><option value="75">&gt; 75%</option><option value="85">&gt; 85%</option><option value="95">&gt; 95%</option></select></div><div id="chart3" class="summary-matrix"></div></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="row">
+                    <div class="col-12">
+                        <div class="card">
+                            <div class="card-body p-2">
+                                <ul class="nav nav-tabs nav-tabs-row2" role="tablist">
+                                    <li class="nav-item"><a class="nav-link active" data-toggle="tab" href="#summaryBusy01">%Busy Socket0 &amp; 1</a></li>
+                                    <li class="nav-item"><a class="nav-link" data-toggle="tab" href="#summaryBusy0">%Busy Socket0</a></li>
+                                    <li class="nav-item"><a class="nav-link" data-toggle="tab" href="#summaryBusy1">%Busy Socket1</a></li>
+                                </ul>
+                                <div class="tab-content mt-2">
+                                    <div id="summaryBusy01" class="tab-pane active"><div class="d-flex justify-content-start align-items-center mb-1"><select class="chart-threshold form-control form-control-sm" data-chart="4" style="width:auto;"><option value="50">&gt; 50%</option><option value="75">&gt; 75%</option><option value="85">&gt; 85%</option><option value="95">&gt; 95%</option></select></div><div id="chart4" class="summary-matrix"></div></div>
+                                    <div id="summaryBusy0" class="tab-pane"><div class="d-flex justify-content-start align-items-center mb-1"><select class="chart-threshold form-control form-control-sm" data-chart="5" style="width:auto;"><option value="50">&gt; 50%</option><option value="75">&gt; 75%</option><option value="85">&gt; 85%</option><option value="95">&gt; 95%</option></select></div><div id="chart5" class="summary-matrix"></div></div>
+                                    <div id="summaryBusy1" class="tab-pane"><div class="d-flex justify-content-start align-items-center mb-1"><select class="chart-threshold form-control form-control-sm" data-chart="6" style="width:auto;"><option value="50">&gt; 50%</option><option value="75">&gt; 75%</option><option value="85">&gt; 85%</option><option value="95">&gt; 95%</option></select></div><div id="chart6" class="summary-matrix"></div></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            </div>
             <div class="mt-3 text-muted" style="font-size: 12px;">
                 GUI Info: {{ gui_script }} — {{ gui_path }}<br>
                 API Info: {{ api_script }} — {{ api_path }}
@@ -532,6 +781,7 @@ def index():
     </body>
     </html>
     ''', columns=columns, filter_options=filter_options, filters=filters, filtered_df=filtered_df, sort_col=sort_col, sort_dir=sort_dir, refresh_status=refresh_status, last_refresh=last_refresh, refresh_error=refresh_error,
+        chart_data_url=url_for('chart_data', _external=False),
         gui_script=os.path.basename(__file__),
         gui_path=os.path.abspath(__file__),
         api_script='check_cpu_usage.py',
