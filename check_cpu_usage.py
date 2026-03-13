@@ -2,8 +2,9 @@ import paramiko
 import csv
 import os
 import ast
+import json
+import subprocess
 from typing import List, Dict, Optional
-import concurrent.futures
 import time
 import logging
 from collections import defaultdict
@@ -471,17 +472,56 @@ def main():
                     #only add the server once with the full team name (e.g., "TAO+OMNIA") but not with the individual sub-team names to avoid duplicates in the output. The full team name will be included in the 'team' column of the output CSV, and we can see which servers are shared by looking for team names that contain '+'. If we added the server multiple times under each sub-team, it would inflate the count of servers for those teams and make it harder to identify shared servers.
                     break
         
-    # Enumerate globally so that 'num' is unique across all servers (not per team)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
-        future_to_idx_server = {
-            # idx here is the global server number (1..N), not per-team
-            executor.submit(process_server, idx, server, team_key, user, serverDict2, logger): (idx, server)
+    # Enumerate globally so that 'num' is unique across all servers (not per team).
+    # All SSH work is handled by the Go binary (ssh_cpu_check), which runs every
+    # server concurrently via goroutines instead of 7-at-a-time Python threads.
+    go_binary = os.path.join(os.path.dirname(__file__), 'ssh_cpu_check')
+    go_input = {
+        'user': user,
+        'servers': [
+            {'idx': idx, 'server': server, 'team': team_key}
             for idx, (team_key, server) in enumerate(all_team_server_pairs, 1)
-        }
-        for future in concurrent.futures.as_completed(future_to_idx_server):
-            row = future.result()
-            if row:
-                all_server_rows.append(row)
+        ],
+    }
+    proc = subprocess.run(
+        [go_binary],
+        input=json.dumps(go_input).encode(),
+        capture_output=True,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        err_msg = proc.stderr.decode(errors='replace')
+        logger.error(f"Go subprocess failed (exit {proc.returncode}): {err_msg}")
+        raise RuntimeError(f"ssh_cpu_check error: {err_msg}")
+    # Forward Go's stderr (progress/error lines) to our logger.
+    for line in proc.stderr.decode(errors='replace').splitlines():
+        if line.strip():
+            logger.info(f"[go] {line}")
+
+    go_output = json.loads(proc.stdout)
+    for r in go_output['results']:
+        if r.get('error', '').startswith('SKIP'):
+            continue
+        server = r['server']
+        idx = r['idx']
+        team_key = r['team']
+        details = serverDict2.get(server, [{}])
+        d = details[0] if details else {}
+        aws_az = server[3:8] if server[:3].upper() in ('TA-', 'AC-') else d.get('aws_az', '')
+        owner = d.get('owner', '')
+        instance_type = d.get('instance_type', '')
+        if r.get('error'):
+            row = [idx, server, '', team_key, '', '', '', '', '', '', '', '', r['error'], '', '', '']
+        else:
+            row = [
+                idx, server, aws_az, team_key, owner, instance_type,
+                r['sockets'], r['iso_cpus'],
+                r['pct_busy_socket0'], r['pct_busy_socket1'],
+                r['pct_free_socket0'], r['pct_free_socket1'],
+                r['busy_socket0'], r['busy_socket1'],
+                r['idle_socket0'], r['idle_socket1'],
+            ]
+        all_server_rows.append(row)
     end_time = time.time() - start_time
     logger.info(f"Total servers to checked: {len(all_team_server_pairs)}")
     logger.info(f"Completed in {end_time:.2f} seconds.")
