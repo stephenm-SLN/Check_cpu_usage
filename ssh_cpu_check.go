@@ -69,6 +69,53 @@ type Output struct {
 	Results []ServerResult `json:"results"`
 }
 
+// ---------- Single combined remote command ----------
+
+// serverCheckCmd runs everything needed in one SSH session:
+//   - isolated CPU list
+//   - lscpu socket/NUMA info
+//   - /proc/stat sample 1
+//   - sleep 1  (on the remote, eliminating a Go round-trip)
+//   - /proc/stat sample 2
+//
+// Sections are separated by fixed delimiters so the output can be split
+// without ambiguity.
+const (
+	sepLscpu = "===LSCPU==="
+	sepStat1 = "===STAT1==="
+	sepStat2 = "===STAT2==="
+)
+
+const serverCheckCmd = "(cat /sys/devices/system/cpu/isolated 2>/dev/null || " +
+	"grep -o 'isolcpus=[^ ]*' /proc/cmdline | cut -d= -f2); " +
+	"echo '" + sepLscpu + "'; lscpu | grep -E 'Socket|NUMA'; " +
+	"echo '" + sepStat1 + "'; cat /proc/stat | grep '^cpu[0-9]'; " +
+	"sleep 1; " +
+	"echo '" + sepStat2 + "'; cat /proc/stat | grep '^cpu[0-9]'"
+
+// splitSections splits the combined command output into its four parts.
+func splitSections(output string) (iso, lscpu, stat1, stat2 string) {
+	p := strings.SplitN(output, sepLscpu, 2)
+	if len(p) < 2 {
+		return
+	}
+	iso = strings.TrimSpace(p[0])
+
+	p = strings.SplitN(p[1], sepStat1, 2)
+	if len(p) < 2 {
+		return
+	}
+	lscpu = strings.TrimSpace(p[0])
+
+	p = strings.SplitN(p[1], sepStat2, 2)
+	if len(p) < 2 {
+		return
+	}
+	stat1 = strings.TrimSpace(p[0])
+	stat2 = strings.TrimSpace(p[1])
+	return
+}
+
 // ---------- CPU list parsing ----------
 
 // parseCPUList parses a CPU list like "2,3,5-7" into [2,3,5,6,7].
@@ -106,10 +153,12 @@ func parseCPUList(s string) []int {
 
 // ---------- lscpu output parsing ----------
 
-// parseLscpuOutput parses the combined stdout of:
+// parseLscpuOutput parses the combined iso+lscpu section:
 //
-//	"cat /sys/devices/system/cpu/isolated 2>/dev/null || grep -o 'isolcpus=[^ ]*' /proc/cmdline | cut -d= -f2"
-//	" && lscpu | grep -E 'Socket|NUMA'"
+//	line 0:  isolated CPU list (e.g. "1-31,35-63"), absent when no isolated CPUs
+//	line 1:  Socket(s): N
+//	line 2:  NUMA node(s): N
+//	line 3+: NUMA node0 CPU(s): 0-31, NUMA node1 CPU(s): 32-63, …
 //
 // Returns (sockets, socketCPUSets, isoCPUs).
 // socketCPUSets maps socket index → CPU list; nil when no isolated CPUs found.
@@ -175,17 +224,7 @@ func parseLscpuOutput(raw string) (int, map[int][]int, string) {
 	return sockets, socketCPUSets, isoCPUs
 }
 
-// ---------- SSH helpers ----------
-
-func runCommand(client *ssh.Client, cmd string) (string, error) {
-	sess, err := client.NewSession()
-	if err != nil {
-		return "", err
-	}
-	defer sess.Close()
-	out, err := sess.Output(cmd)
-	return string(out), err
-}
+// ---------- /proc/stat parsing and CPU status computation ----------
 
 func parseProcStat(out string) map[int][]int {
 	m := map[int][]int{}
@@ -219,42 +258,9 @@ type cpuStatus struct {
 	status string // "Busy", "Idle", or "Unknown"
 }
 
-// getCPUIdleStatus mirrors Python's get_cpu_idle_status: reads /proc/stat
-// twice with a 1-second gap and computes busy/idle per CPU.
-func getCPUIdleStatus(client *ssh.Client, isoCPUs string) ([]cpuStatus, error) {
-	isoCPUList := parseCPUList(isoCPUs)
-	isoCPUSet := make(map[int]bool, len(isoCPUList))
-	for _, c := range isoCPUList {
-		isoCPUSet[c] = true
-	}
-
-	var cpuIndices []int
-	if len(isoCPUList) == 0 {
-		out, err := runCommand(client, "nproc")
-		if err != nil {
-			return nil, fmt.Errorf("nproc: %w", err)
-		}
-		n, err := strconv.Atoi(strings.TrimSpace(out))
-		if err != nil {
-			return nil, fmt.Errorf("parsing nproc: %w", err)
-		}
-		for i := 0; i < n; i++ {
-			cpuIndices = append(cpuIndices, i)
-		}
-	} else {
-		cpuIndices = isoCPUList
-	}
-
-	stat1, err := runCommand(client, "cat /proc/stat | grep '^cpu[0-9]'")
-	if err != nil {
-		return nil, fmt.Errorf("first /proc/stat read: %w", err)
-	}
-	time.Sleep(1 * time.Second)
-	stat2, err := runCommand(client, "cat /proc/stat | grep '^cpu[0-9]'")
-	if err != nil {
-		return nil, fmt.Errorf("second /proc/stat read: %w", err)
-	}
-
+// computeCPUStatus calculates busy/idle for each CPU in cpuIndices by
+// comparing two /proc/stat snapshots.
+func computeCPUStatus(cpuIndices []int, stat1, stat2 string) []cpuStatus {
 	times1 := parseProcStat(stat1)
 	times2 := parseProcStat(stat2)
 
@@ -291,7 +297,7 @@ func getCPUIdleStatus(client *ssh.Client, isoCPUs string) ([]cpuStatus, error) {
 		}
 		results = append(results, cpuStatus{cpu: cpu, status: status})
 	}
-	return results, nil
+	return results
 }
 
 // ---------- SSH auth ----------
@@ -317,7 +323,7 @@ func loadPrivateKey(path string) (ssh.Signer, error) {
 // buildAuthMethods builds SSH auth methods by trying, in order:
 //  1. SSH agent via SSH_AUTH_SOCK
 //  2. Key file from SSH_IDENTITY_FILE env var (explicit override)
-//  3. All ~/.ssh/id_* files that are not .pub files
+//  3. All ~/.ssh/id_* and ~/.ssh/*.pem private key files
 //
 // Returns auth methods and the agent connection (caller should defer Close).
 func buildAuthMethods() ([]ssh.AuthMethod, net.Conn) {
@@ -398,10 +404,6 @@ func processServer(s ServerInput, sshConfig *ssh.ClientConfig) ServerResult {
 		return res
 	}
 
-	isoCmd := "cat /sys/devices/system/cpu/isolated 2>/dev/null || grep -o 'isolcpus=[^ ]*' /proc/cmdline | cut -d= -f2"
-	lscpuCmd := "lscpu | grep -E 'Socket|NUMA'"
-	combinedCmd := isoCmd + " && " + lscpuCmd
-
 	client, err := ssh.Dial("tcp", s.Server+":22", sshConfig)
 	if err != nil {
 		res.Error = fmt.Sprintf("SSH connect ERROR: %v", err)
@@ -410,14 +412,27 @@ func processServer(s ServerInput, sshConfig *ssh.ClientConfig) ServerResult {
 	}
 	defer client.Close()
 
-	cpuSocketOut, err := runCommand(client, combinedCmd)
+	// One session does everything: iso/lscpu query, two /proc/stat reads,
+	// and the intervening sleep — all on the remote side.
+	sess, err := client.NewSession()
+	if err != nil {
+		res.Error = fmt.Sprintf("SSH session ERROR: %v", err)
+		log.Printf("[%d] %s: %s", s.Idx, s.Server, res.Error)
+		return res
+	}
+	defer sess.Close()
+
+	rawOut, err := sess.Output(serverCheckCmd)
 	if err != nil {
 		res.Error = fmt.Sprintf("SSH command ERROR: %v", err)
 		log.Printf("[%d] %s: %s", s.Idx, s.Server, res.Error)
 		return res
 	}
 
-	sockets, socketCPUSets, isoCPUs := parseLscpuOutput(strings.TrimSpace(cpuSocketOut))
+	iso, lscpuOut, stat1Out, stat2Out := splitSections(string(rawOut))
+
+	// Parse lscpu — parseLscpuOutput expects iso on the first line followed by lscpu lines.
+	sockets, socketCPUSets, isoCPUs := parseLscpuOutput(iso + "\n" + lscpuOut)
 	res.Sockets = sockets
 	res.IsoCPUs = isoCPUs
 
@@ -427,12 +442,7 @@ func processServer(s ServerInput, sshConfig *ssh.ClientConfig) ServerResult {
 		return res
 	}
 
-	cpuResults, err := getCPUIdleStatus(client, isoCPUs)
-	if err != nil {
-		res.Error = fmt.Sprintf("CPU check ERROR: %v", err)
-		log.Printf("[%d] %s: %s", s.Idx, s.Server, res.Error)
-		return res
-	}
+	cpuResults := computeCPUStatus(parseCPUList(isoCPUs), stat1Out, stat2Out)
 
 	socket0Set := make(map[int]bool)
 	socket1Set := make(map[int]bool)
